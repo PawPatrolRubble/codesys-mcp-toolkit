@@ -92,8 +92,49 @@ def read_section(obj, attr):
     text = section.text
     return section, (unicode(text) if text is not None else u"")
 
+def probe_capabilities(project, actual_project):
+    report = {
+        "status": "probed",
+        "project": actual_project,
+        "pythonVersion": sys.version,
+        "scriptengineImported": True,
+        "projectApi": {},
+        "sampleObjects": [],
+        "objectCount": 0,
+        "warnings": []
+    }
+    for feature in ("get_children", "find", "get_name", "dirty", "active_application", "save"):
+        try:
+            report["projectApi"][feature] = hasattr(project, feature)
+        except Exception as e:
+            report["projectApi"][feature] = False
+            report["warnings"].append("Project API %s unavailable: %s" % (feature, e))
+    try:
+        objects = list(project.get_children(True))
+        report["objectCount"] = len(objects)
+        for obj in objects:
+            if len(report["sampleObjects"]) >= 8:
+                break
+            try:
+                details = {"name": unicode(obj.get_name())}
+                for label, attr in (("declaration", "textual_declaration"),
+                                    ("implementation", "textual_implementation")):
+                    details[label] = False
+                    details[label + "Replace"] = False
+                    if hasattr(obj, attr):
+                        doc = getattr(obj, attr)
+                        if doc is not None:
+                            details[label] = hasattr(doc, "text")
+                            details[label + "Replace"] = hasattr(doc, "replace")
+                report["sampleObjects"].append(details)
+            except Exception as e:
+                report["warnings"].append("Cannot inspect sample object: %s" % e)
+    except Exception as e:
+        report["warnings"].append("Cannot enumerate project objects: %s" % e)
+    return report
+
 def process_request(request):
-    if not isinstance(request, dict) or request.get("mode") not in ("preview", "apply"):
+    if not isinstance(request, dict) or request.get("mode") not in ("preview", "apply", "probe"):
         raise ValueError("Unsupported bridge action")
     if request.get("expiresAt", 0) < time.time():
         raise ValueError("Bridge request expired; submit a new request")
@@ -106,6 +147,8 @@ def process_request(request):
     actual_project = normalized(project.path)
     if actual_project != normalized(expected_project):
         raise RuntimeError("Wrong IDE project. Opened: %s; requested: %s" % (actual_project, expected_project))
+    if request["mode"] == "probe":
+        return probe_capabilities(project, actual_project)
     changes = request.get("changes")
     if not isinstance(changes, list) or not 1 <= len(changes) <= 20:
         raise ValueError("Expected 1-20 source changes")
