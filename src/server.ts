@@ -256,7 +256,7 @@ def ensure_project_open(target_project_path):
 # --- End of function ---
 
 # Placeholder for the project file path (must be set in scripts using this snippet)
-PROJECT_FILE_PATH = r"{PROJECT_FILE_PATH}"
+PROJECT_FILE_PATH = __import__("base64").b64decode("{PROJECT_FILE_PATH}").decode("utf-8")
 `;
 
     const CHECK_STATUS_SCRIPT = `
@@ -308,8 +308,8 @@ except Exception as e:
     const CREATE_PROJECT_SCRIPT_TEMPLATE = `
 import sys, scriptengine as script_engine, os, shutil, time, traceback
 # Placeholders
-TEMPLATE_PROJECT_PATH = r'{TEMPLATE_PROJECT_PATH}' # Path to Standard.project
-PROJECT_FILE_PATH = r'{PROJECT_FILE_PATH}'    # Path for the new project (Target Path)
+TEMPLATE_PROJECT_PATH = __import__("base64").b64decode("{TEMPLATE_PROJECT_PATH}").decode("utf-8") # Path to Standard.project
+PROJECT_FILE_PATH = __import__("base64").b64decode("{PROJECT_FILE_PATH}").decode("utf-8")    # Path for the new project (Target Path)
 try:
     print("DEBUG: Python script create_project (copy from template):")
     print("DEBUG:   Template Source = %s" % TEMPLATE_PROJECT_PATH)
@@ -322,10 +322,20 @@ try:
     target_dir = os.path.dirname(PROJECT_FILE_PATH)
     if not os.path.exists(target_dir): print("DEBUG: Creating target directory: %s" % target_dir); os.makedirs(target_dir)
     # Check if target file already exists
-    if os.path.exists(PROJECT_FILE_PATH): print("WARN: Target project file already exists, overwriting: %s" % PROJECT_FILE_PATH)
-
-    print("DEBUG: Copying '%s' to '%s'..." % (TEMPLATE_PROJECT_PATH, PROJECT_FILE_PATH))
-    shutil.copy2(TEMPLATE_PROJECT_PATH, PROJECT_FILE_PATH) # copy2 preserves metadata
+    if os.path.exists(PROJECT_FILE_PATH):
+        raise IOError("Refusing to overwrite existing project: %s" % PROJECT_FILE_PATH)
+    print("DEBUG: Copying template into a new project file.")
+    destination_created = False
+    try:
+        new_fd = os.open(PROJECT_FILE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        destination_created = True
+        with os.fdopen(new_fd, 'wb') as dest_file:
+            with open(TEMPLATE_PROJECT_PATH, 'rb') as source_file:
+                shutil.copyfileobj(source_file, dest_file)
+    except Exception:
+        if destination_created and os.path.exists(PROJECT_FILE_PATH):
+            os.remove(PROJECT_FILE_PATH)
+        raise
     print("DEBUG: File copy complete.")
 
     # 2. Open the newly copied project file
@@ -506,7 +516,7 @@ def find_object_by_path_robust(start_node, full_path, target_type_name="object")
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_NAME = "{POU_NAME}"; POU_TYPE_STR = "{POU_TYPE_STR}"; IMPL_LANGUAGE_STR = "{IMPL_LANGUAGE_STR}"; PARENT_PATH_REL = "{PARENT_PATH}"
+POU_NAME = __import__("base64").b64decode("{POU_NAME}").decode("utf-8"); POU_TYPE_STR = "{POU_TYPE_STR}"; IMPL_LANGUAGE_STR = __import__("base64").b64decode("{IMPL_LANGUAGE_STR}").decode("utf-8"); PARENT_PATH_REL = __import__("base64").b64decode("{PARENT_PATH}").decode("utf-8")
 pou_type_map = { "Program": script_engine.PouType.Program, "FunctionBlock": script_engine.PouType.FunctionBlock, "Function": script_engine.PouType.Function }
 # Map common language names to ImplementationLanguages attributes if needed (optional, None usually works)
 # lang_map = { "ST": script_engine.ImplementationLanguage.st, ... }
@@ -577,9 +587,11 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_FULL_PATH = "{POU_FULL_PATH}" # Expecting format like "Application/MyPOU" or "Folder/SubFolder/MyPOU"
-DECLARATION_CONTENT = """{DECLARATION_CONTENT}"""
-IMPLEMENTATION_CONTENT = """{IMPLEMENTATION_CONTENT}"""
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8") # Expecting format like "Application/MyPOU" or "Folder/SubFolder/MyPOU"
+DECLARATION_PRESENT = {DECLARATION_PRESENT}
+IMPLEMENTATION_PRESENT = {IMPLEMENTATION_PRESENT}
+DECLARATION_CONTENT = __import__("base64").b64decode("{DECLARATION_CONTENT}").decode("utf-8") if DECLARATION_PRESENT else None
+IMPLEMENTATION_CONTENT = __import__("base64").b64decode("{IMPLEMENTATION_CONTENT}").decode("utf-8") if IMPLEMENTATION_PRESENT else None
 
 try:
     print("DEBUG: set_pou_code script: POU_FULL_PATH='%s', Project='%s'" % (POU_FULL_PATH, PROJECT_FILE_PATH))
@@ -596,8 +608,7 @@ try:
     # --- Set Declaration Part ---
     declaration_updated = False
     # Check if the content is actually provided (might be None/empty if only impl is set)
-    has_declaration_content = 'DECLARATION_CONTENT' in locals() or 'DECLARATION_CONTENT' in globals()
-    if has_declaration_content and DECLARATION_CONTENT is not None: # Check not None
+    if DECLARATION_PRESENT:
         if hasattr(target_object, 'textual_declaration'):
             decl_obj = target_object.textual_declaration
             if decl_obj and hasattr(decl_obj, 'replace'):
@@ -619,8 +630,7 @@ try:
 
     # --- Set Implementation Part ---
     implementation_updated = False
-    has_implementation_content = 'IMPLEMENTATION_CONTENT' in locals() or 'IMPLEMENTATION_CONTENT' in globals()
-    if has_implementation_content and IMPLEMENTATION_CONTENT is not None: # Check not None
+    if IMPLEMENTATION_PRESENT:
         if hasattr(target_object, 'textual_implementation'):
             impl_obj = target_object.textual_implementation
             if impl_obj and hasattr(impl_obj, 'replace'):
@@ -640,6 +650,8 @@ try:
         print("DEBUG: Implementation content not provided or is None. Skipping implementation update.")
 
 
+    if (DECLARATION_PRESENT and not declaration_updated) or (IMPLEMENTATION_PRESENT and not implementation_updated):
+        raise RuntimeError("One or more requested code sections could not be updated")
     # --- SAVE THE PROJECT TO PERSIST THE CODE CHANGE ---
     # Only save if something was actually updated to avoid unnecessary saves
     if declaration_updated or implementation_updated:
@@ -656,6 +668,8 @@ try:
          print("DEBUG: No code parts were updated, skipping project save.")
     # --- END SAVING ---
 
+    if not (declaration_updated or implementation_updated):
+        raise RuntimeError("No code section was updated")
     print("Code Set For: %s" % target_name)
     print("Path: %s" % POU_FULL_PATH)
     print("SCRIPT_SUCCESS: Declaration and/or implementation set successfully."); sys.exit(0)
@@ -670,9 +684,9 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-PARENT_POU_FULL_PATH = "{PARENT_POU_FULL_PATH}" # e.g., "Application/MyFB"
-PROPERTY_NAME = "{PROPERTY_NAME}"
-PROPERTY_TYPE = "{PROPERTY_TYPE}"
+PARENT_POU_FULL_PATH = __import__("base64").b64decode("{PARENT_POU_FULL_PATH}").decode("utf-8") # e.g., "Application/MyFB"
+PROPERTY_NAME = __import__("base64").b64decode("{PROPERTY_NAME}").decode("utf-8")
+PROPERTY_TYPE = __import__("base64").b64decode("{PROPERTY_TYPE}").decode("utf-8")
 # Optional: Language for Getter/Setter (usually defaults to ST)
 # LANG_GUID_STR = "{LANG_GUID_STR}" # Example if needed
 
@@ -739,9 +753,9 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-PARENT_POU_FULL_PATH = "{PARENT_POU_FULL_PATH}" # e.g., "Application/MyFB"
-METHOD_NAME = "{METHOD_NAME}"
-RETURN_TYPE = "{RETURN_TYPE}" # Can be empty string for no return type
+PARENT_POU_FULL_PATH = __import__("base64").b64decode("{PARENT_POU_FULL_PATH}").decode("utf-8") # e.g., "Application/MyFB"
+METHOD_NAME = __import__("base64").b64decode("{METHOD_NAME}").decode("utf-8")
+RETURN_TYPE = __import__("base64").b64decode("{RETURN_TYPE}").decode("utf-8") # Can be empty string for no return type
 # Optional: Language
 # LANG_GUID_STR = "{LANG_GUID_STR}" # Example if needed
 
@@ -935,7 +949,7 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_FULL_PATH = "{POU_FULL_PATH}"; CODE_START_MARKER = "### POU CODE START ###"; CODE_END_MARKER = "### POU CODE END ###"
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8"); CODE_START_MARKER = "### POU CODE START ###"; CODE_END_MARKER = "### POU CODE END ###"
 DECL_START_MARKER = "### POU DECLARATION START ###"; DECL_END_MARKER = "### POU DECLARATION END ###"
 IMPL_START_MARKER = "### POU IMPLEMENTATION START ###"; IMPL_END_MARKER = "### POU IMPLEMENTATION END ###"
 
@@ -1051,7 +1065,7 @@ except Exception as e:
         console.error(`Resource request: project structure for ${projectPath}`);
         try {
             const absoluteProjPath = path.normalize(path.isAbsolute(projectPath) ? projectPath : path.join(WORKSPACE_DIR, projectPath));
-            const escapedPathForPython = absoluteProjPath.replace(/\\/g, '\\\\');
+            const escapedPathForPython = Buffer.from(absoluteProjPath, "utf8").toString("base64");
             // *** DEFINE scriptContent ***
             const scriptContent = GET_PROJECT_STRUCTURE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPathForPython);
             // *** END DEFINE scriptContent ***
@@ -1089,10 +1103,10 @@ except Exception as e:
         try {
             const absoluteProjPath = path.normalize(path.isAbsolute(projectPath) ? projectPath : path.join(WORKSPACE_DIR, projectPath));
             const sanitizedPouPath = String(pouPath).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-            const escapedProjPath = absoluteProjPath.replace(/\\/g, '\\\\');
+            const escapedProjPath = Buffer.from(absoluteProjPath, "utf8").toString("base64");
             // *** DEFINE scriptContent ***
             let scriptContent = GET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedProjPath);
-            scriptContent = scriptContent.replace("{POU_FULL_PATH}", sanitizedPouPath);
+            scriptContent = scriptContent.replace("{POU_FULL_PATH}", Buffer.from(sanitizedPouPath, "utf8").toString("base64"));
             // *** END DEFINE scriptContent ***
             const result = await executeCodesysScript(scriptContent, codesysExePath, codesysProfileName);
             let codeText = `Error retrieving code for object '${sanitizedPouPath}' in project '${absoluteProjPath}'.\n\n${result.output}`; let isError = !result.success;
@@ -1142,7 +1156,7 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(filePath) ? filePath : path.join(WORKSPACE_DIR, filePath));
             console.error(`Tool call: open_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = OPEN_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
@@ -1188,7 +1202,7 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Template Error: ${e.message}` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\'); const escTmplPath = templatePath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64"); const escTmplPath = Buffer.from(templatePath, "utf8").toString("base64");
                 const script = CREATE_PROJECT_SCRIPT_TEMPLATE
                     .replace("{PROJECT_FILE_PATH}", escProjPath)
                     .replace("{TEMPLATE_PROJECT_PATH}", escTmplPath);
@@ -1215,7 +1229,7 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
             console.error(`Tool call: save_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = SAVE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
@@ -1245,12 +1259,12 @@ except Exception as e:
 
             console.error(`Tool call: create_pou: Name='${sanName}', Type='${type}', Lang='${language}', Parent='${sanParentPath}', Project='${absPath}'`);
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_POU_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{POU_NAME}", sanName);
+                script = script.replace("{POU_NAME}", Buffer.from(sanName, "utf8").toString("base64"));
                 script = script.replace("{POU_TYPE_STR}", type);
-                script = script.replace("{IMPL_LANGUAGE_STR}", language);
-                script = script.replace("{PARENT_PATH}", sanParentPath);
+                script = script.replace("{IMPL_LANGUAGE_STR}", Buffer.from(language, "utf8").toString("base64"));
+                script = script.replace("{PARENT_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
 
                 console.error(">>> create_pou: PREPARED SCRIPT:", script.substring(0,500)+"...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1282,14 +1296,16 @@ except Exception as e:
             const sanPouPath = pouPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
             console.error(`Tool call: set_pou_code: Target='${sanPouPath}', Project='${absPath}'`);
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 // Escape content for Python triple-quoted strings
-                const sanDeclCode = (declarationCode ?? "").replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
-                const sanImplCode = (implementationCode ?? "").replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
+                const sanDeclCode = Buffer.from(declarationCode ?? "", "utf8").toString("base64");
+                const sanImplCode = Buffer.from(implementationCode ?? "", "utf8").toString("base64");
                 let script = SET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{POU_FULL_PATH}", sanPouPath);
+                script = script.replace("{POU_FULL_PATH}", Buffer.from(sanPouPath, "utf8").toString("base64"));
                 script = script.replace("{DECLARATION_CONTENT}", sanDeclCode);
                 script = script.replace("{IMPLEMENTATION_CONTENT}", sanImplCode);
+                script = script.replace("{DECLARATION_PRESENT}", declarationCode === undefined ? "False" : "True");
+                script = script.replace("{IMPLEMENTATION_PRESENT}", implementationCode === undefined ? "False" : "True");
 
                 console.error(">>> set_pou_code: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1324,11 +1340,11 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Error: Property name and type cannot be empty.` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_PROPERTY_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{PARENT_POU_FULL_PATH}", sanParentPath);
-                script = script.replace("{PROPERTY_NAME}", sanPropName);
-                script = script.replace("{PROPERTY_TYPE}", sanPropType);
+                script = script.replace("{PARENT_POU_FULL_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
+                script = script.replace("{PROPERTY_NAME}", Buffer.from(sanPropName, "utf8").toString("base64"));
+                script = script.replace("{PROPERTY_TYPE}", Buffer.from(sanPropType, "utf8").toString("base64"));
 
                 console.error(">>> create_property: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1366,11 +1382,11 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Error: Method name cannot be empty.` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_METHOD_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{PARENT_POU_FULL_PATH}", sanParentPath);
-                script = script.replace("{METHOD_NAME}", sanMethName);
-                script = script.replace("{RETURN_TYPE}", sanReturnType);
+                script = script.replace("{PARENT_POU_FULL_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
+                script = script.replace("{METHOD_NAME}", Buffer.from(sanMethName, "utf8").toString("base64"));
+                script = script.replace("{RETURN_TYPE}", Buffer.from(sanReturnType, "utf8").toString("base64"));
 
                 console.error(">>> create_method: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1398,7 +1414,7 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
             console.error(`Tool call: compile_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = COMPILE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
@@ -1432,7 +1448,7 @@ except Exception as e:
         console.error("SERVER.TS: Connecting MCP server via stdio...");
         // No need to await connect here if startMcpServer is called by bin.ts which awaits it
         // await server.connect(transport);
-        server.connect(transport); // Connect but don't await here, let bin.ts handle waiting
+        await server.connect(transport); // Wait for MCP transport initialization
         console.error("SERVER.TS: MCP Server connection initiated via stdio.");
         // console.error("SERVER.TS: server.connect() promise resolved successfully."); // This log might be premature now
     } catch (error) {
