@@ -47,6 +47,7 @@ program
     'Workspace directory for relative project paths',
     process.cwd() // Default to current working directory
   )
+  .option('--ide-only', 'Use only the attached LeadSys Studio/CODESYS IDE bridge; do not launch headless CODESYS')
   .parse(process.argv); // Parse the arguments
 
 const options = program.opts();
@@ -66,7 +67,8 @@ console.error(`========================================`);
 const serverConfig = {
     codesysPath: options.codesysPath.trim(),
     profileName: options.codesysProfile.trim(),
-    workspaceDir: options.workspace.trim() // Pass workspace dir
+    workspaceDir: options.workspace.trim(), // Pass workspace dir
+    ideOnly: Boolean(options.ideOnly)
 };
 // --- End Prepare Config ---
 
