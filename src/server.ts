@@ -1979,6 +1979,24 @@ except Exception as e:
     }).strict();
 
     server.tool(
+        "ide_probe_capabilities",
+        "Queue a read-only compatibility check of the already-open LeadSys Studio or CODESYS IDE. " +
+        "Run the generated execute_pending.py from Tools > Scripting, then call ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const queued = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "probe");
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(queued, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE compatibility probe could not be queued: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
         "ide_preview_project_changes",
         "Queue non-mutating ST code preview against the already-open IDE's in-memory project; " +
         "requires manual execution of the IDE bridge script, then ide_get_bridge_result.",
