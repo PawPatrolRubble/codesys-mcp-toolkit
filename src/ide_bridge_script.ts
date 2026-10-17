@@ -6,7 +6,7 @@
  * over IPC. The CODESYS Scripting Engine executes this on the IDE's own thread.
  * Python 2.7 / IronPython compatibility is intentional.
  */
-export const IDE_BRIDGE_ONCE_PY = String.raw\`# -*- coding: utf-8 -*-
+export const IDE_BRIDGE_ONCE_PY = String.raw`# -*- coding: utf-8 -*-
 import os, sys, json, re, base64, hmac, hashlib, traceback, time
 import scriptengine as se
 
@@ -213,4 +213,4 @@ def main():
     print("CODESYS MCP IDE bridge processed %d request(s); %d pending initially." % (count, len(files)))
 
 main()
-\`;
+`;
