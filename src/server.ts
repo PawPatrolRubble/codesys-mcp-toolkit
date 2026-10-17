@@ -1833,6 +1833,48 @@ except Exception as e:
             }
         });
 
+    const libraryOperation = async (operation: "list" | "add" | "remove", projectFilePath: string,
+        libraryName: string, version: string, parentPath: string) => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = operation === "list" ? null : await snapshotProject(absolutePath);
+            const script = LIBRARY_OPERATION_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{LIB_OP}", operation)
+                .replace("{LIB_PARENT}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{LIB_NAME}", Buffer.from(libraryName, "utf8").toString("base64"))
+                .replace("{LIB_VERSION}", Buffer.from(version, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "Library operation failed." +
+                    (snapshot ? " Backup: " + snapshot.backup : "") + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ operation: string }>(result.output, "MCP_LIB_JSON:");
+            if (!data || data.operation !== operation)
+                throw new Error("Invalid library operation result");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data,
+                ...(snapshot ? { backup: snapshot.backup, backupSha256: snapshot.sha256 } : {}) }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "Library operation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("list_libraries", "Read referenced libraries without changing the project.",
+        { projectFilePath: z.string().min(1), parentPath: iecParent },
+        async ({ projectFilePath, parentPath }) => libraryOperation("list", projectFilePath, "", "", parentPath ?? "Application"));
+    server.tool("add_library", "Add an installed library reference, with a verified project backup first.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          version: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, version, parentPath }) =>
+            libraryOperation("add", projectFilePath, libraryName.trim(), version ?? "", parentPath ?? "Application"));
+    server.tool("remove_library", "Remove an exact library reference with explicit confirmation and backup.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          confirmRemoval: z.boolean(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, confirmRemoval, parentPath }) => {
+            if (!confirmRemoval)
+                return { content: [{ type: "text" as const, text: "Explicit confirmRemoval=true is required." }], isError: true };
+            return libraryOperation("remove", projectFilePath, libraryName, "", parentPath ?? "Application");
+        });
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
