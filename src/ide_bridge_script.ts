@@ -180,7 +180,7 @@ def process_request(request):
         if restore_errors:
             raise RuntimeError("Apply failed; in-memory rollback incomplete: %s" % u"; ".join(restore_errors))
         raise
-    # Deliberately do NOT call project.save(), build(), login(), or PLC actions.
+    # Deliberately no IDE save, build, login, download or PLC runtime actions.
     # Users see modified unsaved code in the SAME IDE and choose whether to save.
     return {"status": "applied_unsaved", "project": actual_project,
             "changes": summaries, "saved": False,
