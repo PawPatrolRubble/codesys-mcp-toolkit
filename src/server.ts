@@ -1686,6 +1686,90 @@ except Exception as e:
         }
     );
 
+    const iecName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "Expected a valid IEC identifier");
+    const iecParent = z.string().min(1).optional();
+    const iecResult = async (projectFilePath: string, parentPath: string, name: string, kind: "gvl" | "dut" | "interface" | "persistent", dutKind = "Structure", baseType = "") => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = await snapshotProject(absolutePath);
+            const script = CREATE_IEC_OBJECT_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{OBJECT_KIND}", kind)
+                .replace("{OBJECT_NAME}", Buffer.from(name, "utf8").toString("base64"))
+                .replace("{PARENT_PATH}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{DUT_KIND}", dutKind)
+                .replace("{BASE_TYPE}", Buffer.from(baseType, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "IEC creation failed; source was backed up to " + snapshot.backup + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ kind: string; name: string; parent: string }>(result.output, "MCP_CREATE_JSON:");
+            if (!data || data.kind !== kind || data.name !== name)
+                throw new Error("CODESYS returned an unexpected created object");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data, backup: snapshot.backup, backupSha256: snapshot.sha256 }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "IEC creation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("create_gvl", "Create a global variable list, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "gvl"));
+    server.tool("create_dut", "Create a STRUCT, ENUM, Alias or Union DUT, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName,
+          dutType: z.enum(["Structure", "Enumeration", "Alias", "Union"]),
+          baseType: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, name, dutType, baseType, parentPath }) => {
+            if (dutType === "Alias" && !baseType)
+                return { content: [{ type: "text" as const, text: "Alias requires baseType" }], isError: true };
+            return iecResult(projectFilePath, parentPath ?? "Application", name, "dut", dutType, baseType ?? "");
+        });
+    server.tool("create_interface", "Create an IEC interface, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "interface"));
+    server.tool("create_persistent_vars", "Create a persistent GVL, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "persistent"));
+
+    server.tool("create_project_snapshot", "Create an exclusive, SHA-256-verified backup of an existing .project file.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+                const snapshot = await snapshotProject(absolutePath);
+                return { content: [{ type: "text" as const, text: JSON.stringify(snapshot, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Backup failed: " + e.message }], isError: true };
+            }
+        });
+
+    server.tool("preview_pou_code_change", "Show exact before/after IEC source without modifying the project.",
+        { projectFilePath: z.string().min(1), pouPath: z.string().min(1),
+          declarationCode: z.string().optional(), implementationCode: z.string().optional() },
+        async ({ projectFilePath, pouPath, declarationCode, implementationCode }) => {
+            if (declarationCode === undefined && implementationCode === undefined)
+                return { content: [{ type: "text" as const, text: "Specify at least one new code section." }], isError: true };
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const normalizedPath = pouPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+            if (!normalizedPath)
+                return { content: [{ type: "text" as const, text: "POU path must not be empty." }], isError: true };
+            try {
+                const script = GET_POU_CODE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{POU_FULL_PATH}", Buffer.from(normalizedPath, "utf8").toString("base64"));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const current = parseJsonRecord<{ declaration: string | null; implementation: string | null }>(result.output, "MCP_POU_JSON:");
+                if (!current || !(typeof current.declaration === "string" || current.declaration === null) ||
+                    !(typeof current.implementation === "string" || current.implementation === null))
+                    throw new Error("Invalid POU read result");
+                const preview = previewCodeChange(current, { declarationCode, implementationCode });
+                return { content: [{ type: "text" as const, text: JSON.stringify({ project: absolutePath, pouPath: normalizedPath, ...preview }, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Preview failed: " + e.message }], isError: true };
+            }
+        });
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
