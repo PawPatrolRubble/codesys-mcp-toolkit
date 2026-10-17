@@ -52,13 +52,17 @@ def read_section(obj, attr):
     return (unicode(data) if data is not None else u""), part
 
 def summarize_before_after(before, after):
-    return {
+    details = {
         "beforeSha256": sha_text(before),
         "afterSha256": sha_text(after),
         "beforeLength": len(before),
         "afterLength": len(after),
         "changed": before != after
     }
+    if REQUEST["mode"] == "preview":
+        details["beforeCode"] = before
+        details["afterCode"] = after
+    return details
 
 def collect_build_report(project):
     try:
