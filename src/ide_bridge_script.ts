@@ -10,6 +10,12 @@ export const IDE_BRIDGE_ONCE_PY = String.raw`# -*- coding: utf-8 -*-
 import os, sys, json, re, base64, hmac, hashlib, traceback, time
 import scriptengine as se
 
+try:
+    unicode
+except NameError:
+    unicode = str
+    basestring = str
+
 BRIDGE_DIR = base64.b64decode("__BRIDGE_DIR_B64__").decode("utf-8")
 REQUESTS = os.path.join(BRIDGE_DIR, "requests")
 RESULTS = os.path.join(BRIDGE_DIR, "results")
@@ -35,7 +41,7 @@ def sign(key, encoded):
 
 def encode_envelope(key, request_id, data):
     raw = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
-    encoded = base64.b64encode(raw.encode("utf-8"))
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
     return {
         "version": 1, "id": request_id, "payload_b64": encoded,
         "signature": sign(key, encoded)
@@ -185,7 +191,7 @@ def persist_result(key, req_id, value):
     temp = os.path.join(RESULTS, req_id + ".tmp")
     final = os.path.join(RESULTS, req_id + ".json")
     with open(temp, "wb") as writer:
-        writer.write(json.dumps(encoded, ensure_ascii=True))
+        writer.write(json.dumps(encoded, ensure_ascii=True).encode("utf-8"))
     os.rename(temp, final)
 
 def main():
