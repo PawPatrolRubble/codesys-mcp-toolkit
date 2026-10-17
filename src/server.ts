@@ -1100,6 +1100,78 @@ except Exception as e:
     print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
 `;
 
+    const GET_POU_CODE_TOOL_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    pou = find_object_by_path_robust(project, POU_FULL_PATH, "POU or IEC object")
+    if pou is None:
+        raise ValueError("Cannot find IEC object at path: %s" % POU_FULL_PATH)
+    def read_text_property(obj, property_name):
+        if not hasattr(obj, property_name):
+            return None
+        text_part = getattr(obj, property_name)
+        if text_part is None:
+            return None
+        if not hasattr(text_part, "text"):
+            raise RuntimeError("IEC object has no readable text in %s" % property_name)
+        value = text_part.text
+        return unicode(value) if value is not None else u""
+    payload = {
+        "path": unicode(POU_FULL_PATH),
+        "name": unicode(pou.get_name()),
+        "declaration": read_text_property(pou, "textual_declaration"),
+        "implementation": read_text_property(pou, "textual_implementation")
+    }
+    print("MCP_POU_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: IEC object code read.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const GET_STRUCTURE_TOOL_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+MAX_DEPTH = {MAX_DEPTH}
+MAX_OBJECTS = {MAX_OBJECTS}
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    total = [0]
+    truncated = [False]
+    def walk(obj, depth, full_path):
+        if total[0] >= MAX_OBJECTS:
+            truncated[0] = True
+            return None
+        total[0] += 1
+        name = unicode(obj.get_name())
+        current_path = (full_path + u"/" + name) if full_path else name
+        result = {"name": name, "path": current_path, "kind": unicode(type(obj).__name__), "children": []}
+        if depth < MAX_DEPTH and hasattr(obj, "get_children"):
+            children = obj.get_children(False)
+            for child in children:
+                item = walk(child, depth + 1, current_path)
+                if item is not None:
+                    result["children"].append(item)
+                if truncated[0]:
+                    break
+        return result
+    root = walk(project, 0, u"")
+    payload = {"project": unicode(PROJECT_FILE_PATH), "objects": total[0], "truncated": truncated[0], "tree": root}
+    print("MCP_STRUCTURE_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Project structure read.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
