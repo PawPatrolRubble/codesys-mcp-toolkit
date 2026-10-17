@@ -1576,6 +1576,65 @@ except Exception as e:
             }
         }
     );
+    server.tool(
+        "get_pou_code",
+        "Read the declaration and implementation of a POU, method, property, GVL or DUT.",
+        {
+            projectFilePath: z.string().min(1),
+            pouPath: z.string().min(1)
+        },
+        async ({ projectFilePath, pouPath }) => {
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const normalizedPouPath = pouPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+            if (!normalizedPouPath) return { content: [{ type: "text" as const, text: "POU path must not be empty." }], isError: true };
+            try {
+                const script = GET_POU_CODE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{POU_FULL_PATH}", Buffer.from(normalizedPouPath, "utf8").toString("base64"));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const data = parseJsonRecord<{ path: string; name: string; declaration: string | null; implementation: string | null }>(result.output, "MCP_POU_JSON:");
+                if (typeof data.path !== "string" || typeof data.name !== "string" ||
+                    !(typeof data.declaration === "string" || data.declaration === null) ||
+                    !(typeof data.implementation === "string" || data.implementation === null))
+                    throw new Error("Invalid POU read result");
+                return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Error reading POU: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "get_project_structure",
+        "Read a bounded CODESYS project object tree as JSON.",
+        {
+            projectFilePath: z.string().min(1),
+            maxDepth: z.number().int().min(1).max(25).optional(),
+            maxObjects: z.number().int().min(1).max(3000).optional()
+        },
+        async ({ projectFilePath, maxDepth, maxObjects }) => {
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            try {
+                const script = GET_STRUCTURE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{MAX_DEPTH}", String(maxDepth ?? 12))
+                    .replace("{MAX_OBJECTS}", String(maxObjects ?? 1000));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const data = parseJsonRecord<{ project: string; objects: number; truncated: boolean; tree: unknown }>(result.output, "MCP_STRUCTURE_JSON:");
+                if (typeof data.project !== "string" || !Number.isInteger(data.objects) ||
+                    typeof data.truncated !== "boolean" || !data.tree)
+                    throw new Error("Invalid project-tree result");
+                return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Error reading project structure: " + e.message }], isError: true };
+            }
+        }
+    );
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
