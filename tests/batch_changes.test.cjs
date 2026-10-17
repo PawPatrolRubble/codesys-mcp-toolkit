@@ -34,7 +34,7 @@ function fakeReport(mode, projectHash, changes, overrides = {}) {
     return {
         mode, status: mode === "apply" ? "saved" : "preview",
         project: "Machine.project", saved: mode === "apply",
-        projectSha256: projectHash, projectSha256After: sha256("modified"),
+        projectSha256: projectHash, projectSha256After: projectHash,
         changes: changes.map(c => ({
             path: c.path, objectType: c.objectType,
             sections: {
