@@ -22,7 +22,8 @@ console.error(`>>> Initial CWD: ${process.cwd()}`);
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeCodesysScript } from "./codesys_interop"; // Assumes this utility exists
+import { executeCodesysScript } from "./codesys_interop";
+import { evaluateBuild, parseJsonRecord } from "./build_results"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -864,14 +865,92 @@ try:
     if not hasattr(target_app, 'build'):
          raise TypeError("Selected object '%s' is not an application or doesn't support build()." % app_name)
 
-    # Execute the build
-    target_app.build();
-    print("DEBUG: Build command executed for application '%s'." % app_name)
+    # The script system exposes IMessageStorage; do not guess from build() not throwing.
+    import json
+    try:
+        msg_system = system
+    except NameError:
+        try:
+            msg_system = script_engine.system
+        except Exception:
+            raise RuntimeError("CODESYS message storage API is unavailable")
 
-    # Check messages is harder without direct access to message store from script.
-    # Rely on CODESYS UI or log output for now.
-    print("Compile Initiated For Application: %s" % app_name); print("In Project: %s" % project_name)
-    print("SCRIPT_SUCCESS: Application compilation initiated."); sys.exit(0)
+    if not hasattr(msg_system, 'get_message_categories') or not hasattr(msg_system, 'get_message_objects'):
+        raise RuntimeError("CODESYS message storage APIs are not available in this profile")
+
+    # Get the installed category list before the build. Active categories may be empty
+    # for a clean compilation with zero compiler messages.
+    all_categories = list(msg_system.get_message_categories(False))
+    if not all_categories:
+        raise RuntimeError("No message categories were returned; cannot verify build")
+
+    target_app.build()
+    print("DEBUG: Build command executed for application '%s'." % app_name)
+    errors = 0
+    warnings = 0
+    messages = []
+    read_failures = []
+    max_messages = 3000
+    for category in all_categories:
+        try:
+            category_name = unicode(msg_system.get_message_category_description(category))
+        except Exception:
+            category_name = unicode(category)
+        try:
+            category_messages = list(msg_system.get_message_objects(category))
+        except Exception as msg_err:
+            read_failures.append("%s: %s" % (category_name, msg_err))
+            continue
+        for msg in category_messages:
+            if len(messages) >= max_messages:
+                read_failures.append("Build messages exceed the %d message limit" % max_messages)
+                break
+            if not hasattr(msg, 'severity'):
+                read_failures.append("Category %s returned messages without severity" % category_name)
+                continue
+            severity = unicode(msg.severity).split('.')[-1]
+            # Different runtime versions may include informational severities.
+            if severity not in ('Error', 'FatalError', 'Warning'):
+                if severity not in ('Info', 'Information', 'Success', 'Debug', 'None'):
+                    read_failures.append("Unrecognized severity %s in category %s" % (severity, category_name))
+                continue
+            obj_name = u""
+            position_text = u""
+            try:
+                obj = msg.object
+                if obj is not None:
+                    obj_name = unicode(obj.get_name())
+            except Exception:
+                pass
+            try:
+                position_text = unicode(msg.position_text or u"")
+            except Exception:
+                pass
+            record = {
+                'category': category_name,
+                'severity': severity,
+                'object': obj_name,
+                'position': position_text,
+                'text': unicode(msg.text or u"")
+            }
+            messages.append(record)
+            if severity in ('Error', 'FatalError'):
+                errors += 1
+            else:
+                warnings += 1
+
+    report = {
+        'application': unicode(app_name),
+        'diagnostics_available': len(read_failures) == 0,
+        'errors': errors, 'warnings': warnings,
+        'categories_scanned': len(all_categories),
+        'message_read_failures': read_failures,
+        'messages': messages
+    }
+    # ensure_ascii protects IronPython stdout and keeps localized errors lossless.
+    print("MCP_BUILD_JSON:" + json.dumps(report, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Build completed and diagnostic scan attempted.")
+    sys.exit(0)
 except Exception as e:
     detailed_error = traceback.format_exc()
     error_message = "Error initiating compilation for project %s: %s\\n%s" % (PROJECT_FILE_PATH, e, detailed_error)
@@ -1417,18 +1496,8 @@ except Exception as e:
                 const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = COMPILE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
-                const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                // Check for actual compile errors in the output log
-                const hasCompileErrors = result.output.includes("Compile complete --") && !/ 0 error\(s\),/.test(result.output);
-                let message = success ? `Compilation initiated for application in ${absPath}. Check CODESYS messages for results.` : `Failed initiating compilation for ${absPath}. Output:\n${result.output}`;
-                let isError = !success; // Base error status on script success
-                if (success && hasCompileErrors) {
-                    message += " WARNING: Build command reported errors in the output log.";
-                    console.warn("Compile project reported build errors in the output.");
-                    // Report as error if compile fails, even if script technically succeeded
-                    isError = true;
-                }
-                return { content: [{ type: "text", text: message }], isError: isError };
+                const build = evaluateBuild(result.output, result.success);
+                return { content: [{ type: "text", text: build.text }], isError: build.isError };
             } catch (e:any) {
                 console.error(`Error compile_project ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
