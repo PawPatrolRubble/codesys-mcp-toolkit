@@ -1900,13 +1900,14 @@ except Exception as e:
         async ({ projectFilePath, changes }) => {
             const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
                 projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
-            return executeBatchOperation(
+            const outcome = await executeBatchOperation(
                 absPath,
                 { mode: "preview", changes: changes as BatchChange[] },
                 ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
                 (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
                 parseJsonRecord
             );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
         }
     );
 
@@ -1924,7 +1925,7 @@ except Exception as e:
         async ({ projectFilePath, expectedProjectSha256, changes, compileAfterApply }) => {
             const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
                 projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
-            return executeBatchOperation(
+            const outcome = await executeBatchOperation(
                 absPath,
                 {
                     mode: "apply",
@@ -1936,6 +1937,7 @@ except Exception as e:
                 (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
                 parseJsonRecord
             );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
         }
     );
 
