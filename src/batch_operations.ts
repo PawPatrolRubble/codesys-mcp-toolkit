@@ -181,6 +181,24 @@ export async function executeBatchOperation(
                 report.backup = backup.backup;
                 report.backupSha256 = backup.sha256;
             }
+            if (report.projectSha256 !== before) {
+                throw new Error("CODESYS reported a different project revision" +
+                    (backup ? ". Backup: " + backup.backup : ""));
+            }
+            if (!report.changes.every((item, i) =>
+                item && item.path === validated[i]?.path &&
+                item.objectType === validated[i]?.objectType &&
+                validated[i] &&
+                (validated[i].declarationCode === undefined ||
+                    (item.sections?.declaration &&
+                     item.sections.declaration.afterSha256 === sha256(validated[i].declarationCode))) &&
+                (validated[i].implementationCode === undefined ||
+                    (item.sections?.implementation &&
+                     item.sections.implementation.afterSha256 === sha256(validated[i].implementationCode)))
+            )) {
+                throw new Error("CODESYS batch result did not match requested edits" +
+                    (backup ? ". Backup: " + backup.backup : ""));
+            }
             if (request.mode === "preview") {
                 const after = await hashProjectFile(projectPath);
                 if (before !== after) throw new Error("Project file changed during preview; results are stale");
@@ -189,9 +207,26 @@ export async function executeBatchOperation(
                     report.changes.length === validated.length;
                 return { isError: !allValid, text: JSON.stringify(report, null, 2) };
             }
+            const compile = report.compile as {
+                errors?: number; warnings?: number; diagnostics_available?: boolean;
+                categories_scanned?: number; message_read_failures?: string[];
+                messages?: Array<{ severity: string }>;
+            } | undefined | null;
+            const compiled = request.compileAfterApply === false || Boolean(
+                compile && compile.errors === 0 &&
+                Number.isInteger(compile.warnings) &&
+                compile.diagnostics_available === true &&
+                (compile.categories_scanned ?? 0) > 0 &&
+                Array.isArray(compile.message_read_failures) &&
+                compile.message_read_failures.length === 0 &&
+                Array.isArray(compile.messages) &&
+                compile.messages.every(item => item &&
+                    !["Error", "FatalError"].includes(item.severity))
+            );
+            const verifiedHash = typeof report.projectSha256After === "string" &&
+                report.projectSha256After === await hashProjectFile(projectPath);
             const saved = result.success && report.status === "saved" && report.saved &&
-                report.changes.length === validated.length &&
-                typeof report.projectSha256After === "string";
+                report.changes.length === validated.length && compiled && verifiedHash;
             return { isError: !saved, text: JSON.stringify(report, null, 2) };
         });
     } catch (e: any) {
