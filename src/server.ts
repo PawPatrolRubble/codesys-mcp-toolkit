@@ -1223,6 +1223,69 @@ except Exception as e:
     sys.exit(1)
 `;
 
+    const LIBRARY_OPERATION_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+LIB_OP = "{LIB_OP}"
+LIB_PARENT = __import__("base64").b64decode("{LIB_PARENT}").decode("utf-8")
+LIB_NAME = __import__("base64").b64decode("{LIB_NAME}").decode("utf-8")
+LIB_VERSION = __import__("base64").b64decode("{LIB_VERSION}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, LIB_PARENT, "Library Manager owner")
+    if parent is None or not hasattr(parent, "get_library_manager"):
+        raise ValueError("Object cannot own a Library Manager: %s" % LIB_PARENT)
+    # Never mutate a project merely to list its libraries.
+    if LIB_OP == "list" and not getattr(parent, "has_library_manager", False):
+        payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": []}
+    else:
+        if LIB_OP == "remove" and not getattr(parent, "has_library_manager", False):
+            raise ValueError("No Library Manager exists for: %s" % LIB_PARENT)
+        lib_obj = parent.get_library_manager()
+        if LIB_OP == "list":
+            libs = list(lib_obj.get_libraries(False))
+            payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": [unicode(x) for x in libs]}
+        elif LIB_OP == "add":
+            try:
+                manager = librarymanager
+            except NameError:
+                manager = getattr(script_engine, "librarymanager", None)
+            if manager is None or not hasattr(manager, "get_all_libraries"):
+                raise RuntimeError("CODESYS installed-library repository API unavailable")
+            matches = []
+            for available in manager.get_all_libraries():
+                title = unicode(getattr(available, "title", u""))
+                displayname = unicode(getattr(available, "displayname", u""))
+                version = unicode(getattr(available, "version", u""))
+                if LIB_NAME.lower() not in (title.lower(), displayname.lower()):
+                    continue
+                if LIB_VERSION and version != LIB_VERSION:
+                    continue
+                matches.append(available)
+            if len(matches) != 1:
+                raise ValueError("Expected one matching installed library, found %d; specify an exact version" % len(matches))
+            lib_obj.add_library(matches[0])
+            project.save()
+            payload = {"operation": "add", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME), "version": unicode(getattr(matches[0], "version", u""))}
+        elif LIB_OP == "remove":
+            libs = [unicode(x) for x in lib_obj.get_libraries(False)]
+            if LIB_NAME not in libs:
+                raise ValueError("Library must exactly match an entry from list_libraries")
+            lib_obj.remove_library(LIB_NAME)
+            project.save()
+            payload = {"operation": "remove", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME)}
+        else:
+            raise ValueError("Invalid library operation")
+    print("MCP_LIB_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Library operation complete.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
