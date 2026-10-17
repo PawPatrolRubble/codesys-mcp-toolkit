@@ -108,6 +108,8 @@ def collect_build_report(project):
         for item in entries:
             severity = unicode(getattr(item, "severity", "")).split(".")[-1]
             if severity not in ("Error", "FatalError", "Warning"):
+                if severity not in ("Info", "Information", "Success", "Debug", "None"):
+                    failures.append("Unrecognized build diagnostic severity %s in %s" % (severity, title))
                 continue
             if len(messages) >= 3000:
                 failures.append("Diagnostic output truncated at 3000 messages")
