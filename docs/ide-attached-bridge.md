@@ -12,9 +12,42 @@ This first version therefore runs a bounded script on the IDE thread each time
 the user explicitly invokes it. Always-on automation requires a supported IDE
 extension and version-specific integration testing.
 
+## Recommended LeadSys Studio SP15 Patch 4 verification
+
+This project targets **LeadSys Studio V3.1.0.0 based on CODESYS V3.5 SP15
+Patch 4** as the first real-world compatibility target. The proprietary
+LeadSys build has **not** been tested yet. It includes Tools > Scripting >
+Execute Script File, but the exposed object API must be checked separately.
+
+The MCP Server can start without a separate standard CODESYS installation:
+
+    npm ci
+    npm run build
+    node dist/bin.js --ide-only --workspace "D:\\PLC"
+
+The workspace must contain the saved test .project file. This mode explicitly
+rejects headless operations rather than starting CODESYS.exe.
+
+On the first workstation test, use only these calls:
+
+1. Call ide_bridge_setup (once per workspace).
+2. Call ide_probe_capabilities with the test project path, such as
+   "D:/PLC/Machine.project". It queues a **read-only** request.
+3. In the currently running LeadSys Studio with that project open, choose
+   Tools > Scripting > Execute Script File and select the generated
+   execute_pending.py.
+4. Call ide_get_bridge_result with the returned requestId.
+   Its signed response reports Python version, core project API support,
+   sampled POU textual-section capabilities, and any errors.
+
+This probe does not edit, compile, save or connect to the PLC. It avoids
+including actual ST source text in the capability report. You can share the
+result to help identify necessary SP15 adaptations. Only after it succeeds
+should you test a preview and then a guarded apply on a disposable project.
+
 ## Setup on Windows
 
-1. Start the MCP server with --workspace pointing to the directory containing
+1. Start the MCP server with --ide-only and --workspace pointing to the directory containing
    the intended Machine.project. Open Machine.project in CODESYS IDE.
 2. Call **ide_bridge_setup**. It creates:
    .codesys-mcp/ide-bridge/execute_pending.py
