@@ -93,8 +93,8 @@ export async function setupIdeBridge(workspace: string): Promise<BridgeLocation>
 export async function queueIdeRequest(
     workspace: string,
     projectFilePath: string,
-    mode: "preview" | "apply",
-    changes: BatchChange[]
+    mode: "preview" | "apply" | "probe",
+    changes: BatchChange[] = []
 ): Promise<{ id: string; state: "queued"; script: string; project: string }> {
     const loc = bridgeLocation(workspace);
     await fs.access(loc.script);
@@ -103,7 +103,7 @@ export async function queueIdeRequest(
     const stat = await fs.lstat(project);
     if (!stat.isFile() || stat.isSymbolicLink())
         throw new Error("Target project must be an existing regular .project file");
-    const validated = prepareBatchChanges(changes, mode);
+    const validated = mode === "probe" ? [] : prepareBatchChanges(changes, mode);
     const id = randomUUID().replace(/-/g, "");
     const request = makeEnvelope(id, {
         mode,
