@@ -35,7 +35,8 @@ const SCRIPT_ERROR_MARKER = 'SCRIPT_ERROR';
 export async function executeCodesysScript(
     scriptContent: string,
     codesysExePath: string,
-    codesysProfileName: string
+    codesysProfileName: string,
+    timeoutMs: number = 60_000
 ): Promise<{ success: boolean; output: string }> {
 
     // --- Pre-checks ---
@@ -95,7 +96,7 @@ export async function executeCodesysScript(
 
             const controller = new AbortController();
             const timeoutSignal = controller.signal;
-            const timeoutDuration = 60000; // 60 seconds
+            const timeoutDuration = Math.max(10_000, Math.min(600_000, timeoutMs));
 
             // Pass the single command string, empty args array, and shell: true
             const childProcess = spawn(codesysExePath, codesysArgs, {
