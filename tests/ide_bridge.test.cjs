@@ -242,3 +242,11 @@ test("request signatures are verifiable and cannot be replayed under another id"
         assert.throws(()=>readAuthenticatedPayload(env,"a".repeat(32),secret),/Invalid IDE/);
     });
 });
+
+test("MCP CLI advertises IDE-only mode and does not require a standard IDE path just for help", () => {
+    const cli = path.resolve(__dirname, "../dist/bin.js");
+    const run = spawnSync(process.execPath, [cli, "--help"], {encoding:"utf8"});
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /--ide-only/);
+    assert.match(run.stdout, /--workspace/);
+});
