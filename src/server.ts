@@ -1561,8 +1561,9 @@ except Exception as e:
             const sanPouPath = pouPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
             console.error(`Tool call: set_pou_code: Target='${sanPouPath}', Project='${absPath}'`);
             try {
+                const snapshot = await snapshotProject(absPath);
                 const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
-                // Escape content for Python triple-quoted strings
+                // UTF-8 payload is base64 encoded to avoid Python quoting and injection
                 const sanDeclCode = Buffer.from(declarationCode ?? "", "utf8").toString("base64");
                 const sanImplCode = Buffer.from(implementationCode ?? "", "utf8").toString("base64");
                 let script = SET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
@@ -1576,7 +1577,7 @@ except Exception as e:
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 console.error(">>> set_pou_code: EXECUTION RESULT:", JSON.stringify(result));
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved.` : `Failed set code for '${sanPouPath}'. Output:\n${result.output}` }], isError: !success };
+                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved. Backup: ${snapshot.backup}.` : `Failed set code for '${sanPouPath}'. Backup: ${snapshot.backup}. Output:\n${result.output}` }], isError: !success };
             } catch (e:any) {
                 console.error(`Error set_pou_code ${sanPouPath} in ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
