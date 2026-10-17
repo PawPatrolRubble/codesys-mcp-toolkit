@@ -111,6 +111,37 @@ test("IDE preview reads current unsaved in-memory code and does not save", {skip
     });
 });
 
+test("SP15 compatibility probe inspects project APIs without changing open code", {skip:!PY_AVAILABLE}, async () => {
+    await fixture(async f => {
+        const queued = await queueIdeRequest(f.workspace, f.project, "probe");
+        assert.equal(queued.state, "queued");
+        execIde(f);
+        const answer = await getIdeResult(f.workspace, queued.id);
+        assert.equal(answer.state, "completed");
+        assert.equal(answer.ok, true, answer.error);
+        assert.equal(answer.result.status, "probed");
+        assert.equal(answer.result.scriptengineImported, true);
+        assert.equal(answer.result.projectApi.get_children, true);
+        assert.ok(answer.result.objectCount >= 2);
+        assert.equal(answer.result.sampleObjects.find(x => x.name === "FB_Axis").implementationReplace, true);
+        const state = JSON.parse(await fs.readFile(f.stateFile, "utf8"));
+        assert.equal(state.implementation, ORIGINAL);
+        assert.equal(await fs.readFile(f.project, "utf8"), "FAKE CODESYS FILE");
+    });
+});
+
+test("compatibility probe rejects an IDE showing another project", {skip:!PY_AVAILABLE}, async () => {
+    await fixture(async f => {
+        const wrong = path.join(f.workspace, "Other.project");
+        await fs.writeFile(wrong, "SECOND FILE");
+        const queued = await queueIdeRequest(f.workspace, wrong, "probe");
+        execIde(f);
+        const answer = await getIdeResult(f.workspace, queued.id);
+        assert.equal(answer.ok, false);
+        assert.match(answer.error, /Wrong IDE project/);
+    });
+});
+
 test("IDE apply checks preview source hash and leaves changes unsaved", {skip:!PY_AVAILABLE}, async () => {
     await fixture(async f => {
         const cmd = proposed().map(x=>({...x,expectedImplementationSha256:sha256(ORIGINAL)}));
