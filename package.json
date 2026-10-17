@@ -7,7 +7,7 @@
     "codesys-mcp-tool": "./dist/bin.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run build && node --test tests/*.test.cjs",
     "build": "tsc",
     "start": "node ./dist/server.js"
   },
