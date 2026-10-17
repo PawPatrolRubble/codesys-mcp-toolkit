@@ -23,7 +23,8 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { executeCodesysScript } from "./codesys_interop";
-import { evaluateBuild, parseJsonRecord } from "./build_results"; // Assumes this utility exists
+import { evaluateBuild, parseJsonRecord } from "./build_results";
+import { snapshotProject, previewCodeChange } from "./project_safety"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -1165,6 +1166,56 @@ try:
     payload = {"project": unicode(PROJECT_FILE_PATH), "objects": total[0], "truncated": truncated[0], "tree": root}
     print("MCP_STRUCTURE_JSON:" + json.dumps(payload, ensure_ascii=True))
     print("SCRIPT_SUCCESS: Project structure read.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const CREATE_IEC_OBJECT_SCRIPT_TEMPLATE = `
+import sys, traceback, json, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+OBJECT_KIND = "{OBJECT_KIND}"
+OBJECT_NAME = __import__("base64").b64decode("{OBJECT_NAME}").decode("utf-8")
+PARENT_PATH = __import__("base64").b64decode("{PARENT_PATH}").decode("utf-8")
+DUT_KIND = "{DUT_KIND}"
+BASE_TYPE = __import__("base64").b64decode("{BASE_TYPE}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, PARENT_PATH, "IEC parent container")
+    if parent is None:
+        raise ValueError("Parent container does not exist: %s" % PARENT_PATH)
+    if OBJECT_KIND == "gvl":
+        created = parent.create_gvl(OBJECT_NAME)
+    elif OBJECT_KIND == "persistent":
+        created = parent.create_persistentvars(OBJECT_NAME)
+    elif OBJECT_KIND == "interface":
+        created = parent.create_interface(OBJECT_NAME)
+    elif OBJECT_KIND == "dut":
+        dut_map = {
+            "Structure": script_engine.DutType.Structure,
+            "Enumeration": script_engine.DutType.Enumeration,
+            "Alias": script_engine.DutType.Alias,
+            "Union": script_engine.DutType.Union
+        }
+        if DUT_KIND not in dut_map:
+            raise ValueError("Unsupported DUT kind: %s" % DUT_KIND)
+        if DUT_KIND == "Alias" and not BASE_TYPE:
+            raise ValueError("Alias requires a baseType")
+        if DUT_KIND == "Alias":
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND], BASE_TYPE)
+        else:
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND])
+    else:
+        raise ValueError("Unknown object kind: %s" % OBJECT_KIND)
+    if created is None:
+        raise RuntimeError("Object creation returned None")
+    project.save()
+    payload = {"kind": OBJECT_KIND, "name": unicode(created.get_name()), "parent": unicode(PARENT_PATH)}
+    print("MCP_CREATE_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Created IEC object and saved project.")
     sys.exit(0)
 except Exception as e:
     print("SCRIPT_ERROR: %s" % e)
