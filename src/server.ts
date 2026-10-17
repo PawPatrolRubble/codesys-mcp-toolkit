@@ -22,7 +22,7 @@ console.error(`>>> Initial CWD: ${process.cwd()}`);
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeCodesysScript } from "./codesys_interop";
+import { executeCodesysScript as executeHeadlessCodesysScript } from "./codesys_interop";
 import { evaluateBuild, parseJsonRecord } from "./build_results";
 import { snapshotProject, previewCodeChange } from "./project_safety";
 import { executeBatchOperation, BatchChange } from "./batch_operations";
@@ -37,6 +37,7 @@ interface ServerConfig {
     codesysPath: string;
     profileName: string;
     workspaceDir: string;
+    ideOnly?: boolean;
 }
 
 // --- Wrap server logic in an exported function ---
@@ -49,6 +50,13 @@ export async function startMcpServer(config: ServerConfig) {
     const WORKSPACE_DIR = config.workspaceDir;
     const codesysExePath = config.codesysPath;
     const codesysProfileName = config.profileName;
+    // IDE Attached mode never starts a second CODESYS instance. Headless
+    // operations fail explicitly while the live-IDE bridge remains available.
+    const executeCodesysScript = (script: string, exe: string, profile: string, timeoutMs?: number) => {
+        if (config.ideOnly)
+            throw new Error("Headless CODESYS operations are disabled with --ide-only; use ide_* tools");
+        return executeHeadlessCodesysScript(script, exe, profile, timeoutMs);
+    };
 
     console.error(`SERVER.TS: Using Workspace Directory: ${WORKSPACE_DIR}`);
     console.error(`SERVER.TS: Using CODESYS Path: ${codesysExePath}`);
@@ -60,7 +68,9 @@ export async function startMcpServer(config: ServerConfig) {
     try {
         // Using sync check here as it's part of initial setup before async operations start
         const fsChecker = require('fs');
-        if (!fsChecker.existsSync(codesysExePath)) {
+        if (config.ideOnly) {
+            console.error("SERVER.TS: IDE-only mode; skipping headless CODESYS executable validation.");
+        } else if (!fsChecker.existsSync(codesysExePath)) {
             console.error(`SERVER.TS ERROR: Determined CODESYS executable path does not exist: ${codesysExePath}`);
             // Consider throwing an error instead of exiting if bin.ts handles the catch
             throw new Error(`CODESYS executable not found at specified path: ${codesysExePath}`);
