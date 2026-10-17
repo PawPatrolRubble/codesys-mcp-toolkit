@@ -25,7 +25,8 @@ import { z } from "zod";
 import { executeCodesysScript } from "./codesys_interop";
 import { evaluateBuild, parseJsonRecord } from "./build_results";
 import { snapshotProject, previewCodeChange } from "./project_safety";
-import { executeBatchOperation, BatchChange } from "./batch_operations"; // Assumes this utility exists
+import { executeBatchOperation, BatchChange } from "./batch_operations";
+import { setupIdeBridge, queueIdeRequest, getIdeResult } from "./ide_bridge"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -1938,6 +1939,89 @@ except Exception as e:
                 parseJsonRecord
             );
             return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+
+    // CODESYS IDE Attached v1: user-triggered execution in the *existing* IDE session.
+    // Does not spawn a new CODESYS process or execute arbitrary Python from MCP.
+    server.tool(
+        "ide_bridge_setup",
+        "Install a signed local command queue and one-shot CODESYS Scripting bridge. " +
+        "In the already-open IDE run the returned .py file using Tools > Scripting > Execute Script File.",
+        {},
+        async () => {
+            try {
+                const location = await setupIdeBridge(WORKSPACE_DIR);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify({
+                        state: "configured",
+                        directory: location.directory,
+                        script: location.script,
+                        howToRun: "CODESYS IDE > Tools > Scripting > Execute Script File > select script",
+                        limitations: "Run the script again for each queued group. Changes are not auto-saved."
+                    }, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE bridge setup failed: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const ideChangeSchema = z.object({
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "ide_preview_project_changes",
+        "Queue non-mutating ST code preview against the already-open IDE's in-memory project; " +
+        "requires manual execution of the IDE bridge script, then ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "preview", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE preview request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_apply_project_changes",
+        "Queue guarded IEC edits for the already-open IDE. Requires reviewed original section hashes. " +
+        "Does not save, compile, download or modify PLC runtime.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "apply", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE apply request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_get_bridge_result",
+        "Read a signed result of a queued IDE command, or show that it is pending.",
+        { requestId: z.string().regex(/^[a-f0-9]{32}$/) },
+        async ({ requestId }) => {
+            try {
+                const result = await getIdeResult(WORKSPACE_DIR, requestId);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+                    isError: result.state === "completed" && !result.ok
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE result could not be read: " + e.message }], isError: true };
+            }
         }
     );
 
