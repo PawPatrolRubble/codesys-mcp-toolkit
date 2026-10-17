@@ -15,7 +15,7 @@ REQUESTS = os.path.join(BRIDGE_DIR, "requests")
 RESULTS = os.path.join(BRIDGE_DIR, "results")
 KEY_PATH = os.path.join(BRIDGE_DIR, "secret.key")
 MAX_COMMANDS = 10
-MAX_BYTES = 1200000
+MAX_BYTES = 8000000
 ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 SHA_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
