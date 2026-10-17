@@ -56,7 +56,7 @@ export async function executeCodesysScript(
     const codesysDir = path.dirname(codesysExePath); // Directory containing CODESYS.exe
 
     try {
-        const normalizedScriptContent = scriptContent.replace(/\r\n/g, '\n'); // Normalize line endings
+        const normalizedScriptContent = `# -*- coding: utf-8 -*-\n${scriptContent.replace(/\r\n/g, '\n')}`;
 
         // <<< --- ADDED SCRIPT CONTENT LOGGING --- >>>
         process.stderr.write(`INTEROP: Script content to be written (first 500 chars):\n`);
@@ -65,24 +65,18 @@ export async function executeCodesysScript(
         process.stderr.write(`------ END SCRIPT SNIPPET (TEMP FILE) -----\n`);
         // <<< --- END SCRIPT CONTENT LOGGING --- >>>
 
-        await writeFile(tempFilePath, normalizedScriptContent, 'latin1'); // Write the normalized content
+        await writeFile(tempFilePath, normalizedScriptContent, 'utf8'); // Preserve Chinese and other Unicode
         process.stderr.write(`INTEROP: Temp script written: ${tempFilePath}\n`);
 
 
-        // --- Construct command string for shell: true ---
-        // Quote the executable path itself
-        const quotedExePath = `"${codesysExePath}"`;
-        // Format arguments exactly as CODESYS seems to want: --option="Value With Spaces"
-        // The outer quotes are for the shell parser.
-        const profileArg = `--profile="${codesysProfileName}"`;
-        const scriptArg = `--runscript="${tempFilePath}"`; // tempFilePath from path.join has correct backslashes for Win
+        // Avoid cmd.exe: pass executable and arguments separately to Node.
+        const codesysArgs = [
+            `--profile=${codesysProfileName}`,
+            '--noUI',
+            `--runscript=${tempFilePath}`,
+        ];
 
-        // Combine into a single string for the shell
-        const fullCommandString = `${quotedExePath} ${profileArg} --noUI ${scriptArg}`;
-        // Example result: "\"C:\\Program Files\\...\\CODESYS.exe\" --profile=\"CODESYS V3.5 SP21\" --noUI --runscript=\"C:\\Users\\...\\script.py\""
-        // --- End command string construction ---
-
-        process.stderr.write(`INTEROP: Spawning command (shell:true): ${fullCommandString}\n`);
+        process.stderr.write(`INTEROP: Spawning CODESYS executable: ${codesysExePath}\n`);
         process.stderr.write(`INTEROP ENV: CWD before spawn: ${process.cwd()}\n`);
         process.stderr.write(`INTEROP ENV: Forcing CWD for spawn: ${codesysDir}\n`); // Re-enabled CWD change
 
@@ -104,12 +98,12 @@ export async function executeCodesysScript(
             const timeoutDuration = 60000; // 60 seconds
 
             // Pass the single command string, empty args array, and shell: true
-            const childProcess = spawn(fullCommandString, [], { // Pass full string, EMPTY args array
+            const childProcess = spawn(codesysExePath, codesysArgs, {
                  windowsHide: true,
                  signal: timeoutSignal,
                  cwd: codesysDir, // Re-enabled CWD change
                  env: spawnEnv,   // Re-enabled ENV change
-                 shell: true      // USE shell: true
+                 shell: false     // Never pass arguments through a command shell
                 });
 
             const timeoutId = setTimeout(() => {
@@ -176,24 +170,13 @@ export async function executeCodesysScript(
              process.stderr.write("INTEROP: Failure determined by CODESYS Script Syntax Error.\n");
              if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: ${stderrOutput}`; // Include the syntax error details
         } else {
-            // No spawn error, no shell error, no profile error, no syntax error -> check markers/exit code
-            process.stderr.write(`INTEROP: Checking markers/exit code (Code: ${exitCode})...\n`);
-            if (output.includes(SCRIPT_SUCCESS_MARKER) || stderrOutput.includes(SCRIPT_SUCCESS_MARKER)) {
-                success = true;
-                process.stderr.write("INTEROP: Success determined by SUCCESS marker.\n");
-            } else if (output.includes(SCRIPT_ERROR_MARKER) || stderrOutput.includes(SCRIPT_ERROR_MARKER)) {
-                success = false; // Explicit error marker found
-                process.stderr.write("INTEROP: Failure determined by ERROR marker.\n");
-            } else {
-                // No markers found, rely solely on exit code
-                success = exitCode === 0;
-                if (success) {
-                    process.stderr.write(`INTEROP: Success determined by exit code 0 (no markers found).\n`);
-                } else {
-                    process.stderr.write(`INTEROP: Failure determined by non-zero exit code ${exitCode} (no markers found).\n`);
-                    // Add generic failure message if stderr doesn't already contain SCRIPT_ERROR
-                    if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: Process failed with exit code ${exitCode} (no markers found).\n${stderrOutput}`;
-                }
+            // A successful CODESYS script requires a zero exit status and an explicit
+            // success marker; do not let a 0 exit status mask a reported script error.
+            const sawSuccess = /^SCRIPT_SUCCESS:/m.test(output);
+            const sawError = /^SCRIPT_ERROR:/m.test(output) || /^SCRIPT_ERROR:/m.test(stderrOutput);
+            success = exitCode === 0 && sawSuccess && !sawError;
+            if (!success) {
+                stderrOutput = `SCRIPT_ERROR: Script failed (exit=${exitCode}, successMarker=${sawSuccess}, errorMarker=${sawError}).\n${stderrOutput}`;
             }
         }
         // --- End Success Determination ---
