@@ -24,7 +24,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { executeCodesysScript } from "./codesys_interop";
 import { evaluateBuild, parseJsonRecord } from "./build_results";
-import { snapshotProject, previewCodeChange } from "./project_safety"; // Assumes this utility exists
+import { snapshotProject, previewCodeChange } from "./project_safety";
+import { executeBatchOperation, BatchChange } from "./batch_operations"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -1875,6 +1876,68 @@ except Exception as e:
                 return { content: [{ type: "text" as const, text: "Explicit confirmRemoval=true is required." }], isError: true };
             return libraryOperation("remove", projectFilePath, libraryName, "", parentPath ?? "Application");
         });
+
+
+    // Bulk operations: plan first, then apply against the exact reviewed source hashes.
+    const batchChangeSchema = z.object({
+        action: z.literal("update").optional(),
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "preview_project_changes",
+        "Read multiple IEC objects and preview proposed source edits without saving. " +
+        "Returns project and original-section hashes required by apply_project_changes.",
+        {
+            projectFilePath: z.string().min(1),
+            changes: z.array(batchChangeSchema).min(1).max(20)
+        },
+        async ({ projectFilePath, changes }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            return executeBatchOperation(
+                absPath,
+                { mode: "preview", changes: changes as BatchChange[] },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+        }
+    );
+
+    server.tool(
+        "apply_project_changes",
+        "Apply 1-20 pre-reviewed IEC source edits in one CODESYS script with preflight, " +
+        "one SHA-256-verified project backup, one save, and optional fail-closed compilation. " +
+        "No automatic rollback or PLC download.",
+        {
+            projectFilePath: z.string().min(1),
+            expectedProjectSha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+            changes: z.array(batchChangeSchema).min(1).max(20),
+            compileAfterApply: z.boolean().optional()
+        },
+        async ({ projectFilePath, expectedProjectSha256, changes, compileAfterApply }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            return executeBatchOperation(
+                absPath,
+                {
+                    mode: "apply",
+                    expectedProjectSha256,
+                    changes: changes as BatchChange[],
+                    compileAfterApply: compileAfterApply ?? true
+                },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+        }
+    );
 
     // --- End Tools ---
 
