@@ -188,6 +188,11 @@ try:
         for changes in resolved:
             for part, content, _section in changes:
                 part.replace(content)
+        for changes in resolved:
+            for part, content, section_name in changes:
+                actual_text = unicode(part.text or u"")
+                if actual_text != content:
+                    raise RuntimeError("Readback verification failed for %s section" % section_name)
         phase = "compiling"
         if REQUEST["compileAfterApply"]:
             report = collect_build_report(project)
