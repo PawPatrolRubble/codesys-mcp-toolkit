@@ -22,8 +22,11 @@ console.error(`>>> Initial CWD: ${process.cwd()}`);
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeCodesysScript } from "./codesys_interop";
-import { evaluateBuild, parseJsonRecord } from "./build_results"; // Assumes this utility exists
+import { executeCodesysScript as executeHeadlessCodesysScript } from "./codesys_interop";
+import { evaluateBuild, parseJsonRecord } from "./build_results";
+import { snapshotProject, previewCodeChange } from "./project_safety";
+import { executeBatchOperation, BatchChange } from "./batch_operations";
+import { setupIdeBridge, queueIdeRequest, getIdeResult } from "./ide_bridge"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -34,6 +37,7 @@ interface ServerConfig {
     codesysPath: string;
     profileName: string;
     workspaceDir: string;
+    ideOnly?: boolean;
 }
 
 // --- Wrap server logic in an exported function ---
@@ -46,6 +50,13 @@ export async function startMcpServer(config: ServerConfig) {
     const WORKSPACE_DIR = config.workspaceDir;
     const codesysExePath = config.codesysPath;
     const codesysProfileName = config.profileName;
+    // IDE Attached mode never starts a second CODESYS instance. Headless
+    // operations fail explicitly while the live-IDE bridge remains available.
+    const executeCodesysScript = (script: string, exe: string, profile: string, timeoutMs?: number) => {
+        if (config.ideOnly)
+            throw new Error("Headless CODESYS operations are disabled with --ide-only; use ide_* tools");
+        return executeHeadlessCodesysScript(script, exe, profile, timeoutMs);
+    };
 
     console.error(`SERVER.TS: Using Workspace Directory: ${WORKSPACE_DIR}`);
     console.error(`SERVER.TS: Using CODESYS Path: ${codesysExePath}`);
@@ -57,7 +68,9 @@ export async function startMcpServer(config: ServerConfig) {
     try {
         // Using sync check here as it's part of initial setup before async operations start
         const fsChecker = require('fs');
-        if (!fsChecker.existsSync(codesysExePath)) {
+        if (config.ideOnly) {
+            console.error("SERVER.TS: IDE-only mode; skipping headless CODESYS executable validation.");
+        } else if (!fsChecker.existsSync(codesysExePath)) {
             console.error(`SERVER.TS ERROR: Determined CODESYS executable path does not exist: ${codesysExePath}`);
             // Consider throwing an error instead of exiting if bin.ts handles the catch
             throw new Error(`CODESYS executable not found at specified path: ${codesysExePath}`);
@@ -1172,6 +1185,119 @@ except Exception as e:
     sys.exit(1)
 `;
 
+    const CREATE_IEC_OBJECT_SCRIPT_TEMPLATE = `
+import sys, traceback, json, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+OBJECT_KIND = "{OBJECT_KIND}"
+OBJECT_NAME = __import__("base64").b64decode("{OBJECT_NAME}").decode("utf-8")
+PARENT_PATH = __import__("base64").b64decode("{PARENT_PATH}").decode("utf-8")
+DUT_KIND = "{DUT_KIND}"
+BASE_TYPE = __import__("base64").b64decode("{BASE_TYPE}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, PARENT_PATH, "IEC parent container")
+    if parent is None:
+        raise ValueError("Parent container does not exist: %s" % PARENT_PATH)
+    if OBJECT_KIND == "gvl":
+        created = parent.create_gvl(OBJECT_NAME)
+    elif OBJECT_KIND == "persistent":
+        created = parent.create_persistentvars(OBJECT_NAME)
+    elif OBJECT_KIND == "interface":
+        created = parent.create_interface(OBJECT_NAME)
+    elif OBJECT_KIND == "dut":
+        dut_map = {
+            "Structure": script_engine.DutType.Structure,
+            "Enumeration": script_engine.DutType.Enumeration,
+            "Alias": script_engine.DutType.Alias,
+            "Union": script_engine.DutType.Union
+        }
+        if DUT_KIND not in dut_map:
+            raise ValueError("Unsupported DUT kind: %s" % DUT_KIND)
+        if DUT_KIND == "Alias" and not BASE_TYPE:
+            raise ValueError("Alias requires a baseType")
+        if DUT_KIND == "Alias":
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND], BASE_TYPE)
+        else:
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND])
+    else:
+        raise ValueError("Unknown object kind: %s" % OBJECT_KIND)
+    if created is None:
+        raise RuntimeError("Object creation returned None")
+    project.save()
+    payload = {"kind": OBJECT_KIND, "name": unicode(created.get_name()), "parent": unicode(PARENT_PATH)}
+    print("MCP_CREATE_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Created IEC object and saved project.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const LIBRARY_OPERATION_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+LIB_OP = "{LIB_OP}"
+LIB_PARENT = __import__("base64").b64decode("{LIB_PARENT}").decode("utf-8")
+LIB_NAME = __import__("base64").b64decode("{LIB_NAME}").decode("utf-8")
+LIB_VERSION = __import__("base64").b64decode("{LIB_VERSION}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, LIB_PARENT, "Library Manager owner")
+    if parent is None or not hasattr(parent, "get_library_manager"):
+        raise ValueError("Object cannot own a Library Manager: %s" % LIB_PARENT)
+    # Never mutate a project merely to list its libraries.
+    if LIB_OP == "list" and not getattr(parent, "has_library_manager", False):
+        payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": []}
+    else:
+        if LIB_OP == "remove" and not getattr(parent, "has_library_manager", False):
+            raise ValueError("No Library Manager exists for: %s" % LIB_PARENT)
+        lib_obj = parent.get_library_manager()
+        if LIB_OP == "list":
+            libs = list(lib_obj.get_libraries(False))
+            payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": [unicode(x) for x in libs]}
+        elif LIB_OP == "add":
+            try:
+                manager = librarymanager
+            except NameError:
+                manager = getattr(script_engine, "librarymanager", None)
+            if manager is None or not hasattr(manager, "get_all_libraries"):
+                raise RuntimeError("CODESYS installed-library repository API unavailable")
+            matches = []
+            for available in manager.get_all_libraries():
+                title = unicode(getattr(available, "title", u""))
+                displayname = unicode(getattr(available, "displayname", u""))
+                version = unicode(getattr(available, "version", u""))
+                if LIB_NAME.lower() not in (title.lower(), displayname.lower()):
+                    continue
+                if LIB_VERSION and version != LIB_VERSION:
+                    continue
+                matches.append(available)
+            if len(matches) != 1:
+                raise ValueError("Expected one matching installed library, found %d; specify an exact version" % len(matches))
+            lib_obj.add_library(matches[0])
+            project.save()
+            payload = {"operation": "add", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME), "version": unicode(getattr(matches[0], "version", u""))}
+        elif LIB_OP == "remove":
+            libs = [unicode(x) for x in lib_obj.get_libraries(False)]
+            if LIB_NAME not in libs:
+                raise ValueError("Library must exactly match an entry from list_libraries")
+            lib_obj.remove_library(LIB_NAME)
+            project.save()
+            payload = {"operation": "remove", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME)}
+        else:
+            raise ValueError("Invalid library operation")
+    print("MCP_LIB_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Library operation complete.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -1447,8 +1573,9 @@ except Exception as e:
             const sanPouPath = pouPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
             console.error(`Tool call: set_pou_code: Target='${sanPouPath}', Project='${absPath}'`);
             try {
+                const snapshot = await snapshotProject(absPath);
                 const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
-                // Escape content for Python triple-quoted strings
+                // UTF-8 payload is base64 encoded to avoid Python quoting and injection
                 const sanDeclCode = Buffer.from(declarationCode ?? "", "utf8").toString("base64");
                 const sanImplCode = Buffer.from(implementationCode ?? "", "utf8").toString("base64");
                 let script = SET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
@@ -1462,7 +1589,7 @@ except Exception as e:
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 console.error(">>> set_pou_code: EXECUTION RESULT:", JSON.stringify(result));
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved.` : `Failed set code for '${sanPouPath}'. Output:\n${result.output}` }], isError: !success };
+                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved. Backup: ${snapshot.backup}.` : `Failed set code for '${sanPouPath}'. Backup: ${snapshot.backup}. Output:\n${result.output}` }], isError: !success };
             } catch (e:any) {
                 console.error(`Error set_pou_code ${sanPouPath} in ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
@@ -1631,6 +1758,297 @@ except Exception as e:
                 return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: false };
             } catch (e: any) {
                 return { content: [{ type: "text" as const, text: "Error reading project structure: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const iecName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "Expected a valid IEC identifier");
+    const iecParent = z.string().min(1).optional();
+    const iecResult = async (projectFilePath: string, parentPath: string, name: string, kind: "gvl" | "dut" | "interface" | "persistent", dutKind = "Structure", baseType = "") => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = await snapshotProject(absolutePath);
+            const script = CREATE_IEC_OBJECT_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{OBJECT_KIND}", kind)
+                .replace("{OBJECT_NAME}", Buffer.from(name, "utf8").toString("base64"))
+                .replace("{PARENT_PATH}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{DUT_KIND}", dutKind)
+                .replace("{BASE_TYPE}", Buffer.from(baseType, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "IEC creation failed; source was backed up to " + snapshot.backup + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ kind: string; name: string; parent: string }>(result.output, "MCP_CREATE_JSON:");
+            if (!data || data.kind !== kind || data.name !== name)
+                throw new Error("CODESYS returned an unexpected created object");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data, backup: snapshot.backup, backupSha256: snapshot.sha256 }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "IEC creation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("create_gvl", "Create a global variable list, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "gvl"));
+    server.tool("create_dut", "Create a STRUCT, ENUM, Alias or Union DUT, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName,
+          dutType: z.enum(["Structure", "Enumeration", "Alias", "Union"]),
+          baseType: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, name, dutType, baseType, parentPath }) => {
+            if (dutType === "Alias" && !baseType)
+                return { content: [{ type: "text" as const, text: "Alias requires baseType" }], isError: true };
+            return iecResult(projectFilePath, parentPath ?? "Application", name, "dut", dutType, baseType ?? "");
+        });
+    server.tool("create_interface", "Create an IEC interface, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "interface"));
+    server.tool("create_persistent_vars", "Create a persistent GVL, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "persistent"));
+
+    server.tool("create_project_snapshot", "Create an exclusive, SHA-256-verified backup of an existing .project file.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+                const snapshot = await snapshotProject(absolutePath);
+                return { content: [{ type: "text" as const, text: JSON.stringify(snapshot, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Backup failed: " + e.message }], isError: true };
+            }
+        });
+
+    server.tool("preview_pou_code_change", "Show exact before/after IEC source without modifying the project.",
+        { projectFilePath: z.string().min(1), pouPath: z.string().min(1),
+          declarationCode: z.string().optional(), implementationCode: z.string().optional() },
+        async ({ projectFilePath, pouPath, declarationCode, implementationCode }) => {
+            if (declarationCode === undefined && implementationCode === undefined)
+                return { content: [{ type: "text" as const, text: "Specify at least one new code section." }], isError: true };
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const normalizedPath = pouPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+            if (!normalizedPath)
+                return { content: [{ type: "text" as const, text: "POU path must not be empty." }], isError: true };
+            try {
+                const script = GET_POU_CODE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{POU_FULL_PATH}", Buffer.from(normalizedPath, "utf8").toString("base64"));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const current = parseJsonRecord<{ declaration: string | null; implementation: string | null }>(result.output, "MCP_POU_JSON:");
+                if (!current || !(typeof current.declaration === "string" || current.declaration === null) ||
+                    !(typeof current.implementation === "string" || current.implementation === null))
+                    throw new Error("Invalid POU read result");
+                const preview = previewCodeChange(current, { declarationCode, implementationCode });
+                return { content: [{ type: "text" as const, text: JSON.stringify({ project: absolutePath, pouPath: normalizedPath, ...preview }, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Preview failed: " + e.message }], isError: true };
+            }
+        });
+
+    const libraryOperation = async (operation: "list" | "add" | "remove", projectFilePath: string,
+        libraryName: string, version: string, parentPath: string) => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = operation === "list" ? null : await snapshotProject(absolutePath);
+            const script = LIBRARY_OPERATION_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{LIB_OP}", operation)
+                .replace("{LIB_PARENT}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{LIB_NAME}", Buffer.from(libraryName, "utf8").toString("base64"))
+                .replace("{LIB_VERSION}", Buffer.from(version, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "Library operation failed." +
+                    (snapshot ? " Backup: " + snapshot.backup : "") + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ operation: string }>(result.output, "MCP_LIB_JSON:");
+            if (!data || data.operation !== operation)
+                throw new Error("Invalid library operation result");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data,
+                ...(snapshot ? { backup: snapshot.backup, backupSha256: snapshot.sha256 } : {}) }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "Library operation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("list_libraries", "Read referenced libraries without changing the project.",
+        { projectFilePath: z.string().min(1), parentPath: iecParent },
+        async ({ projectFilePath, parentPath }) => libraryOperation("list", projectFilePath, "", "", parentPath ?? "Application"));
+    server.tool("add_library", "Add an installed library reference, with a verified project backup first.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          version: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, version, parentPath }) =>
+            libraryOperation("add", projectFilePath, libraryName.trim(), version ?? "", parentPath ?? "Application"));
+    server.tool("remove_library", "Remove an exact library reference with explicit confirmation and backup.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          confirmRemoval: z.boolean(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, confirmRemoval, parentPath }) => {
+            if (!confirmRemoval)
+                return { content: [{ type: "text" as const, text: "Explicit confirmRemoval=true is required." }], isError: true };
+            return libraryOperation("remove", projectFilePath, libraryName, "", parentPath ?? "Application");
+        });
+
+
+    // Bulk operations: plan first, then apply against the exact reviewed source hashes.
+    const batchChangeSchema = z.object({
+        action: z.literal("update").optional(),
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "preview_project_changes",
+        "Read multiple IEC objects and preview proposed source edits without saving. " +
+        "Returns project and original-section hashes required by apply_project_changes.",
+        {
+            projectFilePath: z.string().min(1),
+            changes: z.array(batchChangeSchema).min(1).max(20)
+        },
+        async ({ projectFilePath, changes }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                { mode: "preview", changes: changes as BatchChange[] },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+    server.tool(
+        "apply_project_changes",
+        "Apply 1-20 pre-reviewed IEC source edits in one CODESYS script with preflight, " +
+        "one SHA-256-verified project backup, one save, and optional fail-closed compilation. " +
+        "No automatic rollback or PLC download.",
+        {
+            projectFilePath: z.string().min(1),
+            expectedProjectSha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+            changes: z.array(batchChangeSchema).min(1).max(20),
+            compileAfterApply: z.boolean().optional()
+        },
+        async ({ projectFilePath, expectedProjectSha256, changes, compileAfterApply }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                {
+                    mode: "apply",
+                    expectedProjectSha256,
+                    changes: changes as BatchChange[],
+                    compileAfterApply: compileAfterApply ?? true
+                },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+
+    // CODESYS IDE Attached v1: user-triggered execution in the *existing* IDE session.
+    // Does not spawn a new CODESYS process or execute arbitrary Python from MCP.
+    server.tool(
+        "ide_bridge_setup",
+        "Install a signed local command queue and one-shot CODESYS Scripting bridge. " +
+        "In the already-open IDE run the returned .py file using Tools > Scripting > Execute Script File.",
+        {},
+        async () => {
+            try {
+                const location = await setupIdeBridge(WORKSPACE_DIR);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify({
+                        state: "configured",
+                        directory: location.directory,
+                        script: location.script,
+                        howToRun: "CODESYS IDE > Tools > Scripting > Execute Script File > select script",
+                        limitations: "Run the script again for each queued group. Changes are not auto-saved."
+                    }, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE bridge setup failed: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const ideChangeSchema = z.object({
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "ide_probe_capabilities",
+        "Queue a read-only compatibility check of the already-open LeadSys Studio or CODESYS IDE. " +
+        "Run the generated execute_pending.py from Tools > Scripting, then call ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const queued = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "probe");
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(queued, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE compatibility probe could not be queued: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_preview_project_changes",
+        "Queue non-mutating ST code preview against the already-open IDE's in-memory project; " +
+        "requires manual execution of the IDE bridge script, then ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "preview", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE preview request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_apply_project_changes",
+        "Queue guarded IEC edits for the already-open IDE. Requires reviewed original section hashes. " +
+        "Does not save, compile, download or modify PLC runtime.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "apply", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE apply request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_get_bridge_result",
+        "Read a signed result of a queued IDE command, or show that it is pending.",
+        { requestId: z.string().regex(/^[a-f0-9]{32}$/) },
+        async ({ requestId }) => {
+            try {
+                const result = await getIdeResult(WORKSPACE_DIR, requestId);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+                    isError: result.state === "completed" && !result.ok
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE result could not be read: " + e.message }], isError: true };
             }
         }
     );

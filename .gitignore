@@ -25,3 +25,8 @@ yarn-error.log
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Local CODESYS bridge credentials, command queues and project backups
+.codesys-mcp/
+.codesys-mcp-backups/
+*.codesys-mcp.lock

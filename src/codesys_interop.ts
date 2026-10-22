@@ -35,7 +35,8 @@ const SCRIPT_ERROR_MARKER = 'SCRIPT_ERROR';
 export async function executeCodesysScript(
     scriptContent: string,
     codesysExePath: string,
-    codesysProfileName: string
+    codesysProfileName: string,
+    timeoutMs: number = 60_000
 ): Promise<{ success: boolean; output: string }> {
 
     // --- Pre-checks ---
@@ -92,10 +93,14 @@ export async function executeCodesysScript(
         const spawnResult = await new Promise<{ code: number | null; stdout: string; stderr: string; error?: Error }>((resolve) => {
             let stdoutData = '';
             let stderrData = '';
+            let timedOut = false;
+            let processClosed = false;
+            let processError: Error | undefined;
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
 
             const controller = new AbortController();
             const timeoutSignal = controller.signal;
-            const timeoutDuration = 60000; // 60 seconds
+            const timeoutDuration = Math.max(10_000, Math.min(600_000, timeoutMs));
 
             // Pass the single command string, empty args array, and shell: true
             const childProcess = spawn(codesysExePath, codesysArgs, {
@@ -108,6 +113,7 @@ export async function executeCodesysScript(
 
             const timeoutId = setTimeout(() => {
                 process.stderr.write('INTEROP: Process timeout reached.\n');
+                timedOut = true;
                 controller.abort();
             }, timeoutDuration);
 
@@ -126,28 +132,33 @@ export async function executeCodesysScript(
                 else if (chunk.includes('SyntaxErrorException')) { process.stderr.write(`>>>> INTEROP STDERR DETECTED Syntax Error: ${chunk}\n`); } // More specific check
                 else { process.stderr.write(`INTEROP stderr chunk: ${chunk}\n`); }
             });
-            childProcess.on('error', (spawnError) => { // This catches errors launching the process itself (e.g., command not found by shell)
-                 clearTimeout(timeoutId);
-                 process.stderr.write(`INTEROP SPAWN ERROR (shell:true): ${spawnError.message}\n`);
-                 resolve({ code: (spawnError as NodeJS.ErrnoException).errno ?? 1, stdout: stdoutData, stderr: stderrData, error: spawnError });
+            childProcess.on('error', (spawnError) => {
+                processError = spawnError;
+                process.stderr.write(`INTEROP process error: ${spawnError.message}\n`);
+                // AbortError can arrive before close; waiting for close ensures a running
+                // CODESYS process has stopped before releasing a project lock.
             });
-            childProcess.on('close', (code) => { // This indicates the spawned process exited
+            childProcess.on('close', (code) => {
+                processClosed = true;
                 clearTimeout(timeoutId);
+                if (killTimer) clearTimeout(killTimer);
                 process.stderr.write(`INTEROP: Process closed code: ${code}\n`);
-                resolve({ code: code, stdout: stdoutData, stderr: stderrData });
+                resolve({
+                    code,
+                    stdout: stdoutData,
+                    stderr: stderrData + (timedOut ? "\nTIMEOUT: CODESYS process terminated after timeout." : ""),
+                    error: timedOut ? undefined : processError
+                });
             });
-             timeoutSignal.addEventListener('abort', () => {
-                 process.stderr.write('INTEROP: Abort signal received, attempting to kill process.\n');
-                 if (!childProcess.killed) {
-                    if (!childProcess.kill('SIGTERM')) { // Try graceful termination first
-                        process.stderr.write('INTEROP: SIGTERM failed, attempting SIGKILL in 2s.\n');
-                        setTimeout(() => { if (!childProcess.killed) childProcess.kill('SIGKILL'); }, 2000);
-                    } else {
-                        process.stderr.write('INTEROP: SIGTERM sent.\n');
+            timeoutSignal.addEventListener('abort', () => {
+                process.stderr.write('INTEROP: Abort signal sent; waiting for process closure.\n');
+                killTimer = setTimeout(() => {
+                    if (!processClosed) {
+                        process.stderr.write('INTEROP: Escalating timed-out CODESYS process termination.\n');
+                        childProcess.kill('SIGKILL');
                     }
-                 }
-                 resolve({ code: null, stdout: stdoutData, stderr: stderrData + "\nTIMEOUT: Process aborted due to timeout." });
-             }, { once: true });
+                }, 2000);
+            }, { once: true });
             // --- End Event Listeners ---
         });
 
@@ -157,7 +168,9 @@ export async function executeCodesysScript(
 
         // --- Success Determination Logic ---
         success = false; // Assume failure unless proven otherwise
-        if (spawnResult.error) {
+        if (stderrOutput.includes('TIMEOUT:')) {
+            process.stderr.write('INTEROP: Failure determined by process timeout.\n');
+        } else if (spawnResult.error) {
             process.stderr.write(`INTEROP: Failure determined by spawn error: ${spawnResult.error.message}\n`);
             if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: Spawn failed: ${spawnResult.error.message}\n${stderrOutput}`;
         } else if (stderrOutput.includes('is not recognized as an internal or external command')) {
