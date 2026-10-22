@@ -35,7 +35,8 @@ const SCRIPT_ERROR_MARKER = 'SCRIPT_ERROR';
 export async function executeCodesysScript(
     scriptContent: string,
     codesysExePath: string,
-    codesysProfileName: string
+    codesysProfileName: string,
+    timeoutMs: number = 60_000
 ): Promise<{ success: boolean; output: string }> {
 
     // --- Pre-checks ---
@@ -56,7 +57,7 @@ export async function executeCodesysScript(
     const codesysDir = path.dirname(codesysExePath); // Directory containing CODESYS.exe
 
     try {
-        const normalizedScriptContent = scriptContent.replace(/\r\n/g, '\n'); // Normalize line endings
+        const normalizedScriptContent = `# -*- coding: utf-8 -*-\n${scriptContent.replace(/\r\n/g, '\n')}`;
 
         // <<< --- ADDED SCRIPT CONTENT LOGGING --- >>>
         process.stderr.write(`INTEROP: Script content to be written (first 500 chars):\n`);
@@ -65,24 +66,18 @@ export async function executeCodesysScript(
         process.stderr.write(`------ END SCRIPT SNIPPET (TEMP FILE) -----\n`);
         // <<< --- END SCRIPT CONTENT LOGGING --- >>>
 
-        await writeFile(tempFilePath, normalizedScriptContent, 'latin1'); // Write the normalized content
+        await writeFile(tempFilePath, normalizedScriptContent, 'utf8'); // Preserve Chinese and other Unicode
         process.stderr.write(`INTEROP: Temp script written: ${tempFilePath}\n`);
 
 
-        // --- Construct command string for shell: true ---
-        // Quote the executable path itself
-        const quotedExePath = `"${codesysExePath}"`;
-        // Format arguments exactly as CODESYS seems to want: --option="Value With Spaces"
-        // The outer quotes are for the shell parser.
-        const profileArg = `--profile="${codesysProfileName}"`;
-        const scriptArg = `--runscript="${tempFilePath}"`; // tempFilePath from path.join has correct backslashes for Win
+        // Avoid cmd.exe: pass executable and arguments separately to Node.
+        const codesysArgs = [
+            `--profile=${codesysProfileName}`,
+            '--noUI',
+            `--runscript=${tempFilePath}`,
+        ];
 
-        // Combine into a single string for the shell
-        const fullCommandString = `${quotedExePath} ${profileArg} --noUI ${scriptArg}`;
-        // Example result: "\"C:\\Program Files\\...\\CODESYS.exe\" --profile=\"CODESYS V3.5 SP21\" --noUI --runscript=\"C:\\Users\\...\\script.py\""
-        // --- End command string construction ---
-
-        process.stderr.write(`INTEROP: Spawning command (shell:true): ${fullCommandString}\n`);
+        process.stderr.write(`INTEROP: Spawning CODESYS executable: ${codesysExePath}\n`);
         process.stderr.write(`INTEROP ENV: CWD before spawn: ${process.cwd()}\n`);
         process.stderr.write(`INTEROP ENV: Forcing CWD for spawn: ${codesysDir}\n`); // Re-enabled CWD change
 
@@ -98,22 +93,27 @@ export async function executeCodesysScript(
         const spawnResult = await new Promise<{ code: number | null; stdout: string; stderr: string; error?: Error }>((resolve) => {
             let stdoutData = '';
             let stderrData = '';
+            let timedOut = false;
+            let processClosed = false;
+            let processError: Error | undefined;
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
 
             const controller = new AbortController();
             const timeoutSignal = controller.signal;
-            const timeoutDuration = 60000; // 60 seconds
+            const timeoutDuration = Math.max(10_000, Math.min(600_000, timeoutMs));
 
             // Pass the single command string, empty args array, and shell: true
-            const childProcess = spawn(fullCommandString, [], { // Pass full string, EMPTY args array
+            const childProcess = spawn(codesysExePath, codesysArgs, {
                  windowsHide: true,
                  signal: timeoutSignal,
                  cwd: codesysDir, // Re-enabled CWD change
                  env: spawnEnv,   // Re-enabled ENV change
-                 shell: true      // USE shell: true
+                 shell: false     // Never pass arguments through a command shell
                 });
 
             const timeoutId = setTimeout(() => {
                 process.stderr.write('INTEROP: Process timeout reached.\n');
+                timedOut = true;
                 controller.abort();
             }, timeoutDuration);
 
@@ -132,28 +132,33 @@ export async function executeCodesysScript(
                 else if (chunk.includes('SyntaxErrorException')) { process.stderr.write(`>>>> INTEROP STDERR DETECTED Syntax Error: ${chunk}\n`); } // More specific check
                 else { process.stderr.write(`INTEROP stderr chunk: ${chunk}\n`); }
             });
-            childProcess.on('error', (spawnError) => { // This catches errors launching the process itself (e.g., command not found by shell)
-                 clearTimeout(timeoutId);
-                 process.stderr.write(`INTEROP SPAWN ERROR (shell:true): ${spawnError.message}\n`);
-                 resolve({ code: (spawnError as NodeJS.ErrnoException).errno ?? 1, stdout: stdoutData, stderr: stderrData, error: spawnError });
+            childProcess.on('error', (spawnError) => {
+                processError = spawnError;
+                process.stderr.write(`INTEROP process error: ${spawnError.message}\n`);
+                // AbortError can arrive before close; waiting for close ensures a running
+                // CODESYS process has stopped before releasing a project lock.
             });
-            childProcess.on('close', (code) => { // This indicates the spawned process exited
+            childProcess.on('close', (code) => {
+                processClosed = true;
                 clearTimeout(timeoutId);
+                if (killTimer) clearTimeout(killTimer);
                 process.stderr.write(`INTEROP: Process closed code: ${code}\n`);
-                resolve({ code: code, stdout: stdoutData, stderr: stderrData });
+                resolve({
+                    code,
+                    stdout: stdoutData,
+                    stderr: stderrData + (timedOut ? "\nTIMEOUT: CODESYS process terminated after timeout." : ""),
+                    error: timedOut ? undefined : processError
+                });
             });
-             timeoutSignal.addEventListener('abort', () => {
-                 process.stderr.write('INTEROP: Abort signal received, attempting to kill process.\n');
-                 if (!childProcess.killed) {
-                    if (!childProcess.kill('SIGTERM')) { // Try graceful termination first
-                        process.stderr.write('INTEROP: SIGTERM failed, attempting SIGKILL in 2s.\n');
-                        setTimeout(() => { if (!childProcess.killed) childProcess.kill('SIGKILL'); }, 2000);
-                    } else {
-                        process.stderr.write('INTEROP: SIGTERM sent.\n');
+            timeoutSignal.addEventListener('abort', () => {
+                process.stderr.write('INTEROP: Abort signal sent; waiting for process closure.\n');
+                killTimer = setTimeout(() => {
+                    if (!processClosed) {
+                        process.stderr.write('INTEROP: Escalating timed-out CODESYS process termination.\n');
+                        childProcess.kill('SIGKILL');
                     }
-                 }
-                 resolve({ code: null, stdout: stdoutData, stderr: stderrData + "\nTIMEOUT: Process aborted due to timeout." });
-             }, { once: true });
+                }, 2000);
+            }, { once: true });
             // --- End Event Listeners ---
         });
 
@@ -163,7 +168,9 @@ export async function executeCodesysScript(
 
         // --- Success Determination Logic ---
         success = false; // Assume failure unless proven otherwise
-        if (spawnResult.error) {
+        if (stderrOutput.includes('TIMEOUT:')) {
+            process.stderr.write('INTEROP: Failure determined by process timeout.\n');
+        } else if (spawnResult.error) {
             process.stderr.write(`INTEROP: Failure determined by spawn error: ${spawnResult.error.message}\n`);
             if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: Spawn failed: ${spawnResult.error.message}\n${stderrOutput}`;
         } else if (stderrOutput.includes('is not recognized as an internal or external command')) {
@@ -176,24 +183,13 @@ export async function executeCodesysScript(
              process.stderr.write("INTEROP: Failure determined by CODESYS Script Syntax Error.\n");
              if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: ${stderrOutput}`; // Include the syntax error details
         } else {
-            // No spawn error, no shell error, no profile error, no syntax error -> check markers/exit code
-            process.stderr.write(`INTEROP: Checking markers/exit code (Code: ${exitCode})...\n`);
-            if (output.includes(SCRIPT_SUCCESS_MARKER) || stderrOutput.includes(SCRIPT_SUCCESS_MARKER)) {
-                success = true;
-                process.stderr.write("INTEROP: Success determined by SUCCESS marker.\n");
-            } else if (output.includes(SCRIPT_ERROR_MARKER) || stderrOutput.includes(SCRIPT_ERROR_MARKER)) {
-                success = false; // Explicit error marker found
-                process.stderr.write("INTEROP: Failure determined by ERROR marker.\n");
-            } else {
-                // No markers found, rely solely on exit code
-                success = exitCode === 0;
-                if (success) {
-                    process.stderr.write(`INTEROP: Success determined by exit code 0 (no markers found).\n`);
-                } else {
-                    process.stderr.write(`INTEROP: Failure determined by non-zero exit code ${exitCode} (no markers found).\n`);
-                    // Add generic failure message if stderr doesn't already contain SCRIPT_ERROR
-                    if (!stderrOutput.includes(SCRIPT_ERROR_MARKER)) stderrOutput = `SCRIPT_ERROR: Process failed with exit code ${exitCode} (no markers found).\n${stderrOutput}`;
-                }
+            // A successful CODESYS script requires a zero exit status and an explicit
+            // success marker; do not let a 0 exit status mask a reported script error.
+            const sawSuccess = /^SCRIPT_SUCCESS:/m.test(output);
+            const sawError = /^SCRIPT_ERROR:/m.test(output) || /^SCRIPT_ERROR:/m.test(stderrOutput);
+            success = exitCode === 0 && sawSuccess && !sawError;
+            if (!success) {
+                stderrOutput = `SCRIPT_ERROR: Script failed (exit=${exitCode}, successMarker=${sawSuccess}, errorMarker=${sawError}).\n${stderrOutput}`;
             }
         }
         // --- End Success Determination ---

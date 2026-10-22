@@ -22,7 +22,11 @@ console.error(`>>> Initial CWD: ${process.cwd()}`);
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeCodesysScript } from "./codesys_interop"; // Assumes this utility exists
+import { executeCodesysScript as executeHeadlessCodesysScript } from "./codesys_interop";
+import { evaluateBuild, parseJsonRecord } from "./build_results";
+import { snapshotProject, previewCodeChange } from "./project_safety";
+import { executeBatchOperation, BatchChange } from "./batch_operations";
+import { setupIdeBridge, queueIdeRequest, getIdeResult } from "./ide_bridge"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -33,6 +37,7 @@ interface ServerConfig {
     codesysPath: string;
     profileName: string;
     workspaceDir: string;
+    ideOnly?: boolean;
 }
 
 // --- Wrap server logic in an exported function ---
@@ -45,6 +50,13 @@ export async function startMcpServer(config: ServerConfig) {
     const WORKSPACE_DIR = config.workspaceDir;
     const codesysExePath = config.codesysPath;
     const codesysProfileName = config.profileName;
+    // IDE Attached mode never starts a second CODESYS instance. Headless
+    // operations fail explicitly while the live-IDE bridge remains available.
+    const executeCodesysScript = (script: string, exe: string, profile: string, timeoutMs?: number) => {
+        if (config.ideOnly)
+            throw new Error("Headless CODESYS operations are disabled with --ide-only; use ide_* tools");
+        return executeHeadlessCodesysScript(script, exe, profile, timeoutMs);
+    };
 
     console.error(`SERVER.TS: Using Workspace Directory: ${WORKSPACE_DIR}`);
     console.error(`SERVER.TS: Using CODESYS Path: ${codesysExePath}`);
@@ -56,7 +68,9 @@ export async function startMcpServer(config: ServerConfig) {
     try {
         // Using sync check here as it's part of initial setup before async operations start
         const fsChecker = require('fs');
-        if (!fsChecker.existsSync(codesysExePath)) {
+        if (config.ideOnly) {
+            console.error("SERVER.TS: IDE-only mode; skipping headless CODESYS executable validation.");
+        } else if (!fsChecker.existsSync(codesysExePath)) {
             console.error(`SERVER.TS ERROR: Determined CODESYS executable path does not exist: ${codesysExePath}`);
             // Consider throwing an error instead of exiting if bin.ts handles the catch
             throw new Error(`CODESYS executable not found at specified path: ${codesysExePath}`);
@@ -256,7 +270,7 @@ def ensure_project_open(target_project_path):
 # --- End of function ---
 
 # Placeholder for the project file path (must be set in scripts using this snippet)
-PROJECT_FILE_PATH = r"{PROJECT_FILE_PATH}"
+PROJECT_FILE_PATH = __import__("base64").b64decode("{PROJECT_FILE_PATH}").decode("utf-8")
 `;
 
     const CHECK_STATUS_SCRIPT = `
@@ -308,8 +322,8 @@ except Exception as e:
     const CREATE_PROJECT_SCRIPT_TEMPLATE = `
 import sys, scriptengine as script_engine, os, shutil, time, traceback
 # Placeholders
-TEMPLATE_PROJECT_PATH = r'{TEMPLATE_PROJECT_PATH}' # Path to Standard.project
-PROJECT_FILE_PATH = r'{PROJECT_FILE_PATH}'    # Path for the new project (Target Path)
+TEMPLATE_PROJECT_PATH = __import__("base64").b64decode("{TEMPLATE_PROJECT_PATH}").decode("utf-8") # Path to Standard.project
+PROJECT_FILE_PATH = __import__("base64").b64decode("{PROJECT_FILE_PATH}").decode("utf-8")    # Path for the new project (Target Path)
 try:
     print("DEBUG: Python script create_project (copy from template):")
     print("DEBUG:   Template Source = %s" % TEMPLATE_PROJECT_PATH)
@@ -322,10 +336,20 @@ try:
     target_dir = os.path.dirname(PROJECT_FILE_PATH)
     if not os.path.exists(target_dir): print("DEBUG: Creating target directory: %s" % target_dir); os.makedirs(target_dir)
     # Check if target file already exists
-    if os.path.exists(PROJECT_FILE_PATH): print("WARN: Target project file already exists, overwriting: %s" % PROJECT_FILE_PATH)
-
-    print("DEBUG: Copying '%s' to '%s'..." % (TEMPLATE_PROJECT_PATH, PROJECT_FILE_PATH))
-    shutil.copy2(TEMPLATE_PROJECT_PATH, PROJECT_FILE_PATH) # copy2 preserves metadata
+    if os.path.exists(PROJECT_FILE_PATH):
+        raise IOError("Refusing to overwrite existing project: %s" % PROJECT_FILE_PATH)
+    print("DEBUG: Copying template into a new project file.")
+    destination_created = False
+    try:
+        new_fd = os.open(PROJECT_FILE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        destination_created = True
+        with os.fdopen(new_fd, 'wb') as dest_file:
+            with open(TEMPLATE_PROJECT_PATH, 'rb') as source_file:
+                shutil.copyfileobj(source_file, dest_file)
+    except Exception:
+        if destination_created and os.path.exists(PROJECT_FILE_PATH):
+            os.remove(PROJECT_FILE_PATH)
+        raise
     print("DEBUG: File copy complete.")
 
     # 2. Open the newly copied project file
@@ -506,7 +530,7 @@ def find_object_by_path_robust(start_node, full_path, target_type_name="object")
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_NAME = "{POU_NAME}"; POU_TYPE_STR = "{POU_TYPE_STR}"; IMPL_LANGUAGE_STR = "{IMPL_LANGUAGE_STR}"; PARENT_PATH_REL = "{PARENT_PATH}"
+POU_NAME = __import__("base64").b64decode("{POU_NAME}").decode("utf-8"); POU_TYPE_STR = "{POU_TYPE_STR}"; IMPL_LANGUAGE_STR = __import__("base64").b64decode("{IMPL_LANGUAGE_STR}").decode("utf-8"); PARENT_PATH_REL = __import__("base64").b64decode("{PARENT_PATH}").decode("utf-8")
 pou_type_map = { "Program": script_engine.PouType.Program, "FunctionBlock": script_engine.PouType.FunctionBlock, "Function": script_engine.PouType.Function }
 # Map common language names to ImplementationLanguages attributes if needed (optional, None usually works)
 # lang_map = { "ST": script_engine.ImplementationLanguage.st, ... }
@@ -577,9 +601,11 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_FULL_PATH = "{POU_FULL_PATH}" # Expecting format like "Application/MyPOU" or "Folder/SubFolder/MyPOU"
-DECLARATION_CONTENT = """{DECLARATION_CONTENT}"""
-IMPLEMENTATION_CONTENT = """{IMPLEMENTATION_CONTENT}"""
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8") # Expecting format like "Application/MyPOU" or "Folder/SubFolder/MyPOU"
+DECLARATION_PRESENT = {DECLARATION_PRESENT}
+IMPLEMENTATION_PRESENT = {IMPLEMENTATION_PRESENT}
+DECLARATION_CONTENT = __import__("base64").b64decode("{DECLARATION_CONTENT}").decode("utf-8") if DECLARATION_PRESENT else None
+IMPLEMENTATION_CONTENT = __import__("base64").b64decode("{IMPLEMENTATION_CONTENT}").decode("utf-8") if IMPLEMENTATION_PRESENT else None
 
 try:
     print("DEBUG: set_pou_code script: POU_FULL_PATH='%s', Project='%s'" % (POU_FULL_PATH, PROJECT_FILE_PATH))
@@ -596,8 +622,7 @@ try:
     # --- Set Declaration Part ---
     declaration_updated = False
     # Check if the content is actually provided (might be None/empty if only impl is set)
-    has_declaration_content = 'DECLARATION_CONTENT' in locals() or 'DECLARATION_CONTENT' in globals()
-    if has_declaration_content and DECLARATION_CONTENT is not None: # Check not None
+    if DECLARATION_PRESENT:
         if hasattr(target_object, 'textual_declaration'):
             decl_obj = target_object.textual_declaration
             if decl_obj and hasattr(decl_obj, 'replace'):
@@ -619,8 +644,7 @@ try:
 
     # --- Set Implementation Part ---
     implementation_updated = False
-    has_implementation_content = 'IMPLEMENTATION_CONTENT' in locals() or 'IMPLEMENTATION_CONTENT' in globals()
-    if has_implementation_content and IMPLEMENTATION_CONTENT is not None: # Check not None
+    if IMPLEMENTATION_PRESENT:
         if hasattr(target_object, 'textual_implementation'):
             impl_obj = target_object.textual_implementation
             if impl_obj and hasattr(impl_obj, 'replace'):
@@ -640,6 +664,8 @@ try:
         print("DEBUG: Implementation content not provided or is None. Skipping implementation update.")
 
 
+    if (DECLARATION_PRESENT and not declaration_updated) or (IMPLEMENTATION_PRESENT and not implementation_updated):
+        raise RuntimeError("One or more requested code sections could not be updated")
     # --- SAVE THE PROJECT TO PERSIST THE CODE CHANGE ---
     # Only save if something was actually updated to avoid unnecessary saves
     if declaration_updated or implementation_updated:
@@ -656,6 +682,8 @@ try:
          print("DEBUG: No code parts were updated, skipping project save.")
     # --- END SAVING ---
 
+    if not (declaration_updated or implementation_updated):
+        raise RuntimeError("No code section was updated")
     print("Code Set For: %s" % target_name)
     print("Path: %s" % POU_FULL_PATH)
     print("SCRIPT_SUCCESS: Declaration and/or implementation set successfully."); sys.exit(0)
@@ -670,9 +698,9 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-PARENT_POU_FULL_PATH = "{PARENT_POU_FULL_PATH}" # e.g., "Application/MyFB"
-PROPERTY_NAME = "{PROPERTY_NAME}"
-PROPERTY_TYPE = "{PROPERTY_TYPE}"
+PARENT_POU_FULL_PATH = __import__("base64").b64decode("{PARENT_POU_FULL_PATH}").decode("utf-8") # e.g., "Application/MyFB"
+PROPERTY_NAME = __import__("base64").b64decode("{PROPERTY_NAME}").decode("utf-8")
+PROPERTY_TYPE = __import__("base64").b64decode("{PROPERTY_TYPE}").decode("utf-8")
 # Optional: Language for Getter/Setter (usually defaults to ST)
 # LANG_GUID_STR = "{LANG_GUID_STR}" # Example if needed
 
@@ -739,9 +767,9 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-PARENT_POU_FULL_PATH = "{PARENT_POU_FULL_PATH}" # e.g., "Application/MyFB"
-METHOD_NAME = "{METHOD_NAME}"
-RETURN_TYPE = "{RETURN_TYPE}" # Can be empty string for no return type
+PARENT_POU_FULL_PATH = __import__("base64").b64decode("{PARENT_POU_FULL_PATH}").decode("utf-8") # e.g., "Application/MyFB"
+METHOD_NAME = __import__("base64").b64decode("{METHOD_NAME}").decode("utf-8")
+RETURN_TYPE = __import__("base64").b64decode("{RETURN_TYPE}").decode("utf-8") # Can be empty string for no return type
 # Optional: Language
 # LANG_GUID_STR = "{LANG_GUID_STR}" # Example if needed
 
@@ -850,14 +878,92 @@ try:
     if not hasattr(target_app, 'build'):
          raise TypeError("Selected object '%s' is not an application or doesn't support build()." % app_name)
 
-    # Execute the build
-    target_app.build();
-    print("DEBUG: Build command executed for application '%s'." % app_name)
+    # The script system exposes IMessageStorage; do not guess from build() not throwing.
+    import json
+    try:
+        msg_system = system
+    except NameError:
+        try:
+            msg_system = script_engine.system
+        except Exception:
+            raise RuntimeError("CODESYS message storage API is unavailable")
 
-    # Check messages is harder without direct access to message store from script.
-    # Rely on CODESYS UI or log output for now.
-    print("Compile Initiated For Application: %s" % app_name); print("In Project: %s" % project_name)
-    print("SCRIPT_SUCCESS: Application compilation initiated."); sys.exit(0)
+    if not hasattr(msg_system, 'get_message_categories') or not hasattr(msg_system, 'get_message_objects'):
+        raise RuntimeError("CODESYS message storage APIs are not available in this profile")
+
+    # Get the installed category list before the build. Active categories may be empty
+    # for a clean compilation with zero compiler messages.
+    all_categories = list(msg_system.get_message_categories(False))
+    if not all_categories:
+        raise RuntimeError("No message categories were returned; cannot verify build")
+
+    target_app.build()
+    print("DEBUG: Build command executed for application '%s'." % app_name)
+    errors = 0
+    warnings = 0
+    messages = []
+    read_failures = []
+    max_messages = 3000
+    for category in all_categories:
+        try:
+            category_name = unicode(msg_system.get_message_category_description(category))
+        except Exception:
+            category_name = unicode(category)
+        try:
+            category_messages = list(msg_system.get_message_objects(category))
+        except Exception as msg_err:
+            read_failures.append("%s: %s" % (category_name, msg_err))
+            continue
+        for msg in category_messages:
+            if len(messages) >= max_messages:
+                read_failures.append("Build messages exceed the %d message limit" % max_messages)
+                break
+            if not hasattr(msg, 'severity'):
+                read_failures.append("Category %s returned messages without severity" % category_name)
+                continue
+            severity = unicode(msg.severity).split('.')[-1]
+            # Different runtime versions may include informational severities.
+            if severity not in ('Error', 'FatalError', 'Warning'):
+                if severity not in ('Info', 'Information', 'Success', 'Debug', 'None'):
+                    read_failures.append("Unrecognized severity %s in category %s" % (severity, category_name))
+                continue
+            obj_name = u""
+            position_text = u""
+            try:
+                obj = msg.object
+                if obj is not None:
+                    obj_name = unicode(obj.get_name())
+            except Exception:
+                pass
+            try:
+                position_text = unicode(msg.position_text or u"")
+            except Exception:
+                pass
+            record = {
+                'category': category_name,
+                'severity': severity,
+                'object': obj_name,
+                'position': position_text,
+                'text': unicode(msg.text or u"")
+            }
+            messages.append(record)
+            if severity in ('Error', 'FatalError'):
+                errors += 1
+            else:
+                warnings += 1
+
+    report = {
+        'application': unicode(app_name),
+        'diagnostics_available': len(read_failures) == 0,
+        'errors': errors, 'warnings': warnings,
+        'categories_scanned': len(all_categories),
+        'message_read_failures': read_failures,
+        'messages': messages
+    }
+    # ensure_ascii protects IronPython stdout and keeps localized errors lossless.
+    print("MCP_BUILD_JSON:" + json.dumps(report, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Build completed and diagnostic scan attempted.")
+    sys.exit(0)
 except Exception as e:
     detailed_error = traceback.format_exc()
     error_message = "Error initiating compilation for project %s: %s\\n%s" % (PROJECT_FILE_PATH, e, detailed_error)
@@ -935,7 +1041,7 @@ except Exception as e:
 import sys, scriptengine as script_engine, os, traceback
 ${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
 ${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
-POU_FULL_PATH = "{POU_FULL_PATH}"; CODE_START_MARKER = "### POU CODE START ###"; CODE_END_MARKER = "### POU CODE END ###"
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8"); CODE_START_MARKER = "### POU CODE START ###"; CODE_END_MARKER = "### POU CODE END ###"
 DECL_START_MARKER = "### POU DECLARATION START ###"; DECL_END_MARKER = "### POU DECLARATION END ###"
 IMPL_START_MARKER = "### POU IMPLEMENTATION START ###"; IMPL_END_MARKER = "### POU IMPLEMENTATION END ###"
 
@@ -1007,6 +1113,191 @@ except Exception as e:
     print(error_message); print("SCRIPT_ERROR: %s" % error_message); sys.exit(1)
 `;
 
+    const GET_POU_CODE_TOOL_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+POU_FULL_PATH = __import__("base64").b64decode("{POU_FULL_PATH}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    pou = find_object_by_path_robust(project, POU_FULL_PATH, "POU or IEC object")
+    if pou is None:
+        raise ValueError("Cannot find IEC object at path: %s" % POU_FULL_PATH)
+    def read_text_property(obj, property_name):
+        if not hasattr(obj, property_name):
+            return None
+        text_part = getattr(obj, property_name)
+        if text_part is None:
+            return None
+        if not hasattr(text_part, "text"):
+            raise RuntimeError("IEC object has no readable text in %s" % property_name)
+        value = text_part.text
+        return unicode(value) if value is not None else u""
+    payload = {
+        "path": unicode(POU_FULL_PATH),
+        "name": unicode(pou.get_name()),
+        "declaration": read_text_property(pou, "textual_declaration"),
+        "implementation": read_text_property(pou, "textual_implementation")
+    }
+    print("MCP_POU_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: IEC object code read.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const GET_STRUCTURE_TOOL_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+MAX_DEPTH = {MAX_DEPTH}
+MAX_OBJECTS = {MAX_OBJECTS}
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    total = [0]
+    truncated = [False]
+    def walk(obj, depth, full_path):
+        if total[0] >= MAX_OBJECTS:
+            truncated[0] = True
+            return None
+        total[0] += 1
+        name = unicode(obj.get_name())
+        current_path = (full_path + u"/" + name) if full_path else name
+        result = {"name": name, "path": current_path, "kind": unicode(type(obj).__name__), "children": []}
+        if depth < MAX_DEPTH and hasattr(obj, "get_children"):
+            children = obj.get_children(False)
+            for child in children:
+                item = walk(child, depth + 1, current_path)
+                if item is not None:
+                    result["children"].append(item)
+                if truncated[0]:
+                    break
+        return result
+    root = walk(project, 0, u"")
+    payload = {"project": unicode(PROJECT_FILE_PATH), "objects": total[0], "truncated": truncated[0], "tree": root}
+    print("MCP_STRUCTURE_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Project structure read.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const CREATE_IEC_OBJECT_SCRIPT_TEMPLATE = `
+import sys, traceback, json, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+OBJECT_KIND = "{OBJECT_KIND}"
+OBJECT_NAME = __import__("base64").b64decode("{OBJECT_NAME}").decode("utf-8")
+PARENT_PATH = __import__("base64").b64decode("{PARENT_PATH}").decode("utf-8")
+DUT_KIND = "{DUT_KIND}"
+BASE_TYPE = __import__("base64").b64decode("{BASE_TYPE}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, PARENT_PATH, "IEC parent container")
+    if parent is None:
+        raise ValueError("Parent container does not exist: %s" % PARENT_PATH)
+    if OBJECT_KIND == "gvl":
+        created = parent.create_gvl(OBJECT_NAME)
+    elif OBJECT_KIND == "persistent":
+        created = parent.create_persistentvars(OBJECT_NAME)
+    elif OBJECT_KIND == "interface":
+        created = parent.create_interface(OBJECT_NAME)
+    elif OBJECT_KIND == "dut":
+        dut_map = {
+            "Structure": script_engine.DutType.Structure,
+            "Enumeration": script_engine.DutType.Enumeration,
+            "Alias": script_engine.DutType.Alias,
+            "Union": script_engine.DutType.Union
+        }
+        if DUT_KIND not in dut_map:
+            raise ValueError("Unsupported DUT kind: %s" % DUT_KIND)
+        if DUT_KIND == "Alias" and not BASE_TYPE:
+            raise ValueError("Alias requires a baseType")
+        if DUT_KIND == "Alias":
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND], BASE_TYPE)
+        else:
+            created = parent.create_dut(OBJECT_NAME, dut_map[DUT_KIND])
+    else:
+        raise ValueError("Unknown object kind: %s" % OBJECT_KIND)
+    if created is None:
+        raise RuntimeError("Object creation returned None")
+    project.save()
+    payload = {"kind": OBJECT_KIND, "name": unicode(created.get_name()), "parent": unicode(PARENT_PATH)}
+    print("MCP_CREATE_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Created IEC object and saved project.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
+    const LIBRARY_OPERATION_SCRIPT_TEMPLATE = `
+import sys, json, traceback, scriptengine as script_engine
+${ENSURE_PROJECT_OPEN_PYTHON_SNIPPET}
+${FIND_OBJECT_BY_PATH_PYTHON_SNIPPET}
+LIB_OP = "{LIB_OP}"
+LIB_PARENT = __import__("base64").b64decode("{LIB_PARENT}").decode("utf-8")
+LIB_NAME = __import__("base64").b64decode("{LIB_NAME}").decode("utf-8")
+LIB_VERSION = __import__("base64").b64decode("{LIB_VERSION}").decode("utf-8")
+try:
+    project = ensure_project_open(PROJECT_FILE_PATH)
+    parent = find_object_by_path_robust(project, LIB_PARENT, "Library Manager owner")
+    if parent is None or not hasattr(parent, "get_library_manager"):
+        raise ValueError("Object cannot own a Library Manager: %s" % LIB_PARENT)
+    # Never mutate a project merely to list its libraries.
+    if LIB_OP == "list" and not getattr(parent, "has_library_manager", False):
+        payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": []}
+    else:
+        if LIB_OP == "remove" and not getattr(parent, "has_library_manager", False):
+            raise ValueError("No Library Manager exists for: %s" % LIB_PARENT)
+        lib_obj = parent.get_library_manager()
+        if LIB_OP == "list":
+            libs = list(lib_obj.get_libraries(False))
+            payload = {"operation": "list", "parent": unicode(LIB_PARENT), "libraries": [unicode(x) for x in libs]}
+        elif LIB_OP == "add":
+            try:
+                manager = librarymanager
+            except NameError:
+                manager = getattr(script_engine, "librarymanager", None)
+            if manager is None or not hasattr(manager, "get_all_libraries"):
+                raise RuntimeError("CODESYS installed-library repository API unavailable")
+            matches = []
+            for available in manager.get_all_libraries():
+                title = unicode(getattr(available, "title", u""))
+                displayname = unicode(getattr(available, "displayname", u""))
+                version = unicode(getattr(available, "version", u""))
+                if LIB_NAME.lower() not in (title.lower(), displayname.lower()):
+                    continue
+                if LIB_VERSION and version != LIB_VERSION:
+                    continue
+                matches.append(available)
+            if len(matches) != 1:
+                raise ValueError("Expected one matching installed library, found %d; specify an exact version" % len(matches))
+            lib_obj.add_library(matches[0])
+            project.save()
+            payload = {"operation": "add", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME), "version": unicode(getattr(matches[0], "version", u""))}
+        elif LIB_OP == "remove":
+            libs = [unicode(x) for x in lib_obj.get_libraries(False)]
+            if LIB_NAME not in libs:
+                raise ValueError("Library must exactly match an entry from list_libraries")
+            lib_obj.remove_library(LIB_NAME)
+            project.save()
+            payload = {"operation": "remove", "parent": unicode(LIB_PARENT), "name": unicode(LIB_NAME)}
+        else:
+            raise ValueError("Invalid library operation")
+    print("MCP_LIB_JSON:" + json.dumps(payload, ensure_ascii=True))
+    print("SCRIPT_SUCCESS: Library operation complete.")
+    sys.exit(0)
+except Exception as e:
+    print("SCRIPT_ERROR: %s" % e)
+    traceback.print_exc()
+    sys.exit(1)
+`;
+
     // --- End Python Script Templates ---
 
     // --- Zod Schemas (moved for clarity before usage) ---
@@ -1051,7 +1342,7 @@ except Exception as e:
         console.error(`Resource request: project structure for ${projectPath}`);
         try {
             const absoluteProjPath = path.normalize(path.isAbsolute(projectPath) ? projectPath : path.join(WORKSPACE_DIR, projectPath));
-            const escapedPathForPython = absoluteProjPath.replace(/\\/g, '\\\\');
+            const escapedPathForPython = Buffer.from(absoluteProjPath, "utf8").toString("base64");
             // *** DEFINE scriptContent ***
             const scriptContent = GET_PROJECT_STRUCTURE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPathForPython);
             // *** END DEFINE scriptContent ***
@@ -1089,10 +1380,10 @@ except Exception as e:
         try {
             const absoluteProjPath = path.normalize(path.isAbsolute(projectPath) ? projectPath : path.join(WORKSPACE_DIR, projectPath));
             const sanitizedPouPath = String(pouPath).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-            const escapedProjPath = absoluteProjPath.replace(/\\/g, '\\\\');
+            const escapedProjPath = Buffer.from(absoluteProjPath, "utf8").toString("base64");
             // *** DEFINE scriptContent ***
             let scriptContent = GET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedProjPath);
-            scriptContent = scriptContent.replace("{POU_FULL_PATH}", sanitizedPouPath);
+            scriptContent = scriptContent.replace("{POU_FULL_PATH}", Buffer.from(sanitizedPouPath, "utf8").toString("base64"));
             // *** END DEFINE scriptContent ***
             const result = await executeCodesysScript(scriptContent, codesysExePath, codesysProfileName);
             let codeText = `Error retrieving code for object '${sanitizedPouPath}' in project '${absoluteProjPath}'.\n\n${result.output}`; let isError = !result.success;
@@ -1142,7 +1433,7 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(filePath) ? filePath : path.join(WORKSPACE_DIR, filePath));
             console.error(`Tool call: open_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = OPEN_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
@@ -1188,7 +1479,7 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Template Error: ${e.message}` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\'); const escTmplPath = templatePath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64"); const escTmplPath = Buffer.from(templatePath, "utf8").toString("base64");
                 const script = CREATE_PROJECT_SCRIPT_TEMPLATE
                     .replace("{PROJECT_FILE_PATH}", escProjPath)
                     .replace("{TEMPLATE_PROJECT_PATH}", escTmplPath);
@@ -1215,7 +1506,7 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
             console.error(`Tool call: save_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = SAVE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
@@ -1245,12 +1536,12 @@ except Exception as e:
 
             console.error(`Tool call: create_pou: Name='${sanName}', Type='${type}', Lang='${language}', Parent='${sanParentPath}', Project='${absPath}'`);
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_POU_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{POU_NAME}", sanName);
+                script = script.replace("{POU_NAME}", Buffer.from(sanName, "utf8").toString("base64"));
                 script = script.replace("{POU_TYPE_STR}", type);
-                script = script.replace("{IMPL_LANGUAGE_STR}", language);
-                script = script.replace("{PARENT_PATH}", sanParentPath);
+                script = script.replace("{IMPL_LANGUAGE_STR}", Buffer.from(language, "utf8").toString("base64"));
+                script = script.replace("{PARENT_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
 
                 console.error(">>> create_pou: PREPARED SCRIPT:", script.substring(0,500)+"...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1282,20 +1573,23 @@ except Exception as e:
             const sanPouPath = pouPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
             console.error(`Tool call: set_pou_code: Target='${sanPouPath}', Project='${absPath}'`);
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
-                // Escape content for Python triple-quoted strings
-                const sanDeclCode = (declarationCode ?? "").replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
-                const sanImplCode = (implementationCode ?? "").replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
+                const snapshot = await snapshotProject(absPath);
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
+                // UTF-8 payload is base64 encoded to avoid Python quoting and injection
+                const sanDeclCode = Buffer.from(declarationCode ?? "", "utf8").toString("base64");
+                const sanImplCode = Buffer.from(implementationCode ?? "", "utf8").toString("base64");
                 let script = SET_POU_CODE_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{POU_FULL_PATH}", sanPouPath);
+                script = script.replace("{POU_FULL_PATH}", Buffer.from(sanPouPath, "utf8").toString("base64"));
                 script = script.replace("{DECLARATION_CONTENT}", sanDeclCode);
                 script = script.replace("{IMPLEMENTATION_CONTENT}", sanImplCode);
+                script = script.replace("{DECLARATION_PRESENT}", declarationCode === undefined ? "False" : "True");
+                script = script.replace("{IMPLEMENTATION_PRESENT}", implementationCode === undefined ? "False" : "True");
 
                 console.error(">>> set_pou_code: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
                 console.error(">>> set_pou_code: EXECUTION RESULT:", JSON.stringify(result));
                 const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved.` : `Failed set code for '${sanPouPath}'. Output:\n${result.output}` }], isError: !success };
+                return { content: [{ type: "text", text: success ? `Code set for '${sanPouPath}' in ${absPath}. Project saved. Backup: ${snapshot.backup}.` : `Failed set code for '${sanPouPath}'. Backup: ${snapshot.backup}. Output:\n${result.output}` }], isError: !success };
             } catch (e:any) {
                 console.error(`Error set_pou_code ${sanPouPath} in ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
@@ -1324,11 +1618,11 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Error: Property name and type cannot be empty.` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_PROPERTY_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{PARENT_POU_FULL_PATH}", sanParentPath);
-                script = script.replace("{PROPERTY_NAME}", sanPropName);
-                script = script.replace("{PROPERTY_TYPE}", sanPropType);
+                script = script.replace("{PARENT_POU_FULL_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
+                script = script.replace("{PROPERTY_NAME}", Buffer.from(sanPropName, "utf8").toString("base64"));
+                script = script.replace("{PROPERTY_TYPE}", Buffer.from(sanPropType, "utf8").toString("base64"));
 
                 console.error(">>> create_property: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1366,11 +1660,11 @@ except Exception as e:
                 return { content: [{ type: "text", text: `Error: Method name cannot be empty.` }], isError: true };
             }
             try {
-                const escProjPath = absPath.replace(/\\/g, '\\\\');
+                const escProjPath = Buffer.from(absPath, "utf8").toString("base64");
                 let script = CREATE_METHOD_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escProjPath);
-                script = script.replace("{PARENT_POU_FULL_PATH}", sanParentPath);
-                script = script.replace("{METHOD_NAME}", sanMethName);
-                script = script.replace("{RETURN_TYPE}", sanReturnType);
+                script = script.replace("{PARENT_POU_FULL_PATH}", Buffer.from(sanParentPath, "utf8").toString("base64"));
+                script = script.replace("{METHOD_NAME}", Buffer.from(sanMethName, "utf8").toString("base64"));
+                script = script.replace("{RETURN_TYPE}", Buffer.from(sanReturnType, "utf8").toString("base64"));
 
                 console.error(">>> create_method: PREPARED SCRIPT:", script.substring(0, 500) + "...");
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
@@ -1398,27 +1692,367 @@ except Exception as e:
             let absPath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
             console.error(`Tool call: compile_project: ${absPath}`);
             try {
-                const escapedPath = absPath.replace(/\\/g, '\\\\');
+                const escapedPath = Buffer.from(absPath, "utf8").toString("base64");
                 const script = COMPILE_PROJECT_SCRIPT_TEMPLATE.replace("{PROJECT_FILE_PATH}", escapedPath);
                 const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
-                const success = result.success && result.output.includes("SCRIPT_SUCCESS");
-                // Check for actual compile errors in the output log
-                const hasCompileErrors = result.output.includes("Compile complete --") && !/ 0 error\(s\),/.test(result.output);
-                let message = success ? `Compilation initiated for application in ${absPath}. Check CODESYS messages for results.` : `Failed initiating compilation for ${absPath}. Output:\n${result.output}`;
-                let isError = !success; // Base error status on script success
-                if (success && hasCompileErrors) {
-                    message += " WARNING: Build command reported errors in the output log.";
-                    console.warn("Compile project reported build errors in the output.");
-                    // Report as error if compile fails, even if script technically succeeded
-                    isError = true;
-                }
-                return { content: [{ type: "text", text: message }], isError: isError };
+                const build = evaluateBuild(result.output, result.success);
+                return { content: [{ type: "text", text: build.text }], isError: build.isError };
             } catch (e:any) {
                 console.error(`Error compile_project ${absPath}: ${e}`);
                 return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
             }
         }
     );
+    server.tool(
+        "get_pou_code",
+        "Read the declaration and implementation of a POU, method, property, GVL or DUT.",
+        {
+            projectFilePath: z.string().min(1),
+            pouPath: z.string().min(1)
+        },
+        async ({ projectFilePath, pouPath }) => {
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const normalizedPouPath = pouPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+            if (!normalizedPouPath) return { content: [{ type: "text" as const, text: "POU path must not be empty." }], isError: true };
+            try {
+                const script = GET_POU_CODE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{POU_FULL_PATH}", Buffer.from(normalizedPouPath, "utf8").toString("base64"));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const data = parseJsonRecord<{ path: string; name: string; declaration: string | null; implementation: string | null }>(result.output, "MCP_POU_JSON:");
+                if (typeof data.path !== "string" || typeof data.name !== "string" ||
+                    !(typeof data.declaration === "string" || data.declaration === null) ||
+                    !(typeof data.implementation === "string" || data.implementation === null))
+                    throw new Error("Invalid POU read result");
+                return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Error reading POU: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "get_project_structure",
+        "Read a bounded CODESYS project object tree as JSON.",
+        {
+            projectFilePath: z.string().min(1),
+            maxDepth: z.number().int().min(1).max(25).optional(),
+            maxObjects: z.number().int().min(1).max(3000).optional()
+        },
+        async ({ projectFilePath, maxDepth, maxObjects }) => {
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            try {
+                const script = GET_STRUCTURE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{MAX_DEPTH}", String(maxDepth ?? 12))
+                    .replace("{MAX_OBJECTS}", String(maxObjects ?? 1000));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const data = parseJsonRecord<{ project: string; objects: number; truncated: boolean; tree: unknown }>(result.output, "MCP_STRUCTURE_JSON:");
+                if (typeof data.project !== "string" || !Number.isInteger(data.objects) ||
+                    typeof data.truncated !== "boolean" || !data.tree)
+                    throw new Error("Invalid project-tree result");
+                return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Error reading project structure: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const iecName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "Expected a valid IEC identifier");
+    const iecParent = z.string().min(1).optional();
+    const iecResult = async (projectFilePath: string, parentPath: string, name: string, kind: "gvl" | "dut" | "interface" | "persistent", dutKind = "Structure", baseType = "") => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = await snapshotProject(absolutePath);
+            const script = CREATE_IEC_OBJECT_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{OBJECT_KIND}", kind)
+                .replace("{OBJECT_NAME}", Buffer.from(name, "utf8").toString("base64"))
+                .replace("{PARENT_PATH}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{DUT_KIND}", dutKind)
+                .replace("{BASE_TYPE}", Buffer.from(baseType, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "IEC creation failed; source was backed up to " + snapshot.backup + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ kind: string; name: string; parent: string }>(result.output, "MCP_CREATE_JSON:");
+            if (!data || data.kind !== kind || data.name !== name)
+                throw new Error("CODESYS returned an unexpected created object");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data, backup: snapshot.backup, backupSha256: snapshot.sha256 }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "IEC creation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("create_gvl", "Create a global variable list, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "gvl"));
+    server.tool("create_dut", "Create a STRUCT, ENUM, Alias or Union DUT, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName,
+          dutType: z.enum(["Structure", "Enumeration", "Alias", "Union"]),
+          baseType: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, name, dutType, baseType, parentPath }) => {
+            if (dutType === "Alias" && !baseType)
+                return { content: [{ type: "text" as const, text: "Alias requires baseType" }], isError: true };
+            return iecResult(projectFilePath, parentPath ?? "Application", name, "dut", dutType, baseType ?? "");
+        });
+    server.tool("create_interface", "Create an IEC interface, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "interface"));
+    server.tool("create_persistent_vars", "Create a persistent GVL, backing up the project first.",
+        { projectFilePath: z.string().min(1), name: iecName, parentPath: iecParent },
+        async ({ projectFilePath, name, parentPath }) => iecResult(projectFilePath, parentPath ?? "Application", name, "persistent"));
+
+    server.tool("create_project_snapshot", "Create an exclusive, SHA-256-verified backup of an existing .project file.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+                const snapshot = await snapshotProject(absolutePath);
+                return { content: [{ type: "text" as const, text: JSON.stringify(snapshot, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Backup failed: " + e.message }], isError: true };
+            }
+        });
+
+    server.tool("preview_pou_code_change", "Show exact before/after IEC source without modifying the project.",
+        { projectFilePath: z.string().min(1), pouPath: z.string().min(1),
+          declarationCode: z.string().optional(), implementationCode: z.string().optional() },
+        async ({ projectFilePath, pouPath, declarationCode, implementationCode }) => {
+            if (declarationCode === undefined && implementationCode === undefined)
+                return { content: [{ type: "text" as const, text: "Specify at least one new code section." }], isError: true };
+            const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const normalizedPath = pouPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+            if (!normalizedPath)
+                return { content: [{ type: "text" as const, text: "POU path must not be empty." }], isError: true };
+            try {
+                const script = GET_POU_CODE_TOOL_SCRIPT_TEMPLATE
+                    .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                    .replace("{POU_FULL_PATH}", Buffer.from(normalizedPath, "utf8").toString("base64"));
+                const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+                if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                    return { content: [{ type: "text" as const, text: result.output }], isError: true };
+                const current = parseJsonRecord<{ declaration: string | null; implementation: string | null }>(result.output, "MCP_POU_JSON:");
+                if (!current || !(typeof current.declaration === "string" || current.declaration === null) ||
+                    !(typeof current.implementation === "string" || current.implementation === null))
+                    throw new Error("Invalid POU read result");
+                const preview = previewCodeChange(current, { declarationCode, implementationCode });
+                return { content: [{ type: "text" as const, text: JSON.stringify({ project: absolutePath, pouPath: normalizedPath, ...preview }, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "Preview failed: " + e.message }], isError: true };
+            }
+        });
+
+    const libraryOperation = async (operation: "list" | "add" | "remove", projectFilePath: string,
+        libraryName: string, version: string, parentPath: string) => {
+        const absolutePath = path.normalize(path.isAbsolute(projectFilePath) ? projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+        try {
+            const snapshot = operation === "list" ? null : await snapshotProject(absolutePath);
+            const script = LIBRARY_OPERATION_SCRIPT_TEMPLATE
+                .replace("{PROJECT_FILE_PATH}", Buffer.from(absolutePath, "utf8").toString("base64"))
+                .replace("{LIB_OP}", operation)
+                .replace("{LIB_PARENT}", Buffer.from(parentPath, "utf8").toString("base64"))
+                .replace("{LIB_NAME}", Buffer.from(libraryName, "utf8").toString("base64"))
+                .replace("{LIB_VERSION}", Buffer.from(version, "utf8").toString("base64"));
+            const result = await executeCodesysScript(script, codesysExePath, codesysProfileName);
+            if (!result.success || !result.output.includes("SCRIPT_SUCCESS:"))
+                return { content: [{ type: "text" as const, text: "Library operation failed." +
+                    (snapshot ? " Backup: " + snapshot.backup : "") + "\n" + result.output }], isError: true };
+            const data = parseJsonRecord<{ operation: string }>(result.output, "MCP_LIB_JSON:");
+            if (!data || data.operation !== operation)
+                throw new Error("Invalid library operation result");
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...data,
+                ...(snapshot ? { backup: snapshot.backup, backupSha256: snapshot.sha256 } : {}) }, null, 2) }], isError: false };
+        } catch (e: any) {
+            return { content: [{ type: "text" as const, text: "Library operation failed: " + e.message }], isError: true };
+        }
+    };
+
+    server.tool("list_libraries", "Read referenced libraries without changing the project.",
+        { projectFilePath: z.string().min(1), parentPath: iecParent },
+        async ({ projectFilePath, parentPath }) => libraryOperation("list", projectFilePath, "", "", parentPath ?? "Application"));
+    server.tool("add_library", "Add an installed library reference, with a verified project backup first.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          version: z.string().optional(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, version, parentPath }) =>
+            libraryOperation("add", projectFilePath, libraryName.trim(), version ?? "", parentPath ?? "Application"));
+    server.tool("remove_library", "Remove an exact library reference with explicit confirmation and backup.",
+        { projectFilePath: z.string().min(1), libraryName: z.string().min(1),
+          confirmRemoval: z.boolean(), parentPath: iecParent },
+        async ({ projectFilePath, libraryName, confirmRemoval, parentPath }) => {
+            if (!confirmRemoval)
+                return { content: [{ type: "text" as const, text: "Explicit confirmRemoval=true is required." }], isError: true };
+            return libraryOperation("remove", projectFilePath, libraryName, "", parentPath ?? "Application");
+        });
+
+
+    // Bulk operations: plan first, then apply against the exact reviewed source hashes.
+    const batchChangeSchema = z.object({
+        action: z.literal("update").optional(),
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "preview_project_changes",
+        "Read multiple IEC objects and preview proposed source edits without saving. " +
+        "Returns project and original-section hashes required by apply_project_changes.",
+        {
+            projectFilePath: z.string().min(1),
+            changes: z.array(batchChangeSchema).min(1).max(20)
+        },
+        async ({ projectFilePath, changes }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                { mode: "preview", changes: changes as BatchChange[] },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+    server.tool(
+        "apply_project_changes",
+        "Apply 1-20 pre-reviewed IEC source edits in one CODESYS script with preflight, " +
+        "one SHA-256-verified project backup, one save, and optional fail-closed compilation. " +
+        "No automatic rollback or PLC download.",
+        {
+            projectFilePath: z.string().min(1),
+            expectedProjectSha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+            changes: z.array(batchChangeSchema).min(1).max(20),
+            compileAfterApply: z.boolean().optional()
+        },
+        async ({ projectFilePath, expectedProjectSha256, changes, compileAfterApply }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                {
+                    mode: "apply",
+                    expectedProjectSha256,
+                    changes: changes as BatchChange[],
+                    compileAfterApply: compileAfterApply ?? true
+                },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+
+    // CODESYS IDE Attached v1: user-triggered execution in the *existing* IDE session.
+    // Does not spawn a new CODESYS process or execute arbitrary Python from MCP.
+    server.tool(
+        "ide_bridge_setup",
+        "Install a signed local command queue and one-shot CODESYS Scripting bridge. " +
+        "In the already-open IDE run the returned .py file using Tools > Scripting > Execute Script File.",
+        {},
+        async () => {
+            try {
+                const location = await setupIdeBridge(WORKSPACE_DIR);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify({
+                        state: "configured",
+                        directory: location.directory,
+                        script: location.script,
+                        howToRun: "CODESYS IDE > Tools > Scripting > Execute Script File > select script",
+                        limitations: "Run the script again for each queued group. Changes are not auto-saved."
+                    }, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE bridge setup failed: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const ideChangeSchema = z.object({
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "ide_probe_capabilities",
+        "Queue a read-only compatibility check of the already-open LeadSys Studio or CODESYS IDE. " +
+        "Run the generated execute_pending.py from Tools > Scripting, then call ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const queued = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "probe");
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(queued, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE compatibility probe could not be queued: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_preview_project_changes",
+        "Queue non-mutating ST code preview against the already-open IDE's in-memory project; " +
+        "requires manual execution of the IDE bridge script, then ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "preview", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE preview request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_apply_project_changes",
+        "Queue guarded IEC edits for the already-open IDE. Requires reviewed original section hashes. " +
+        "Does not save, compile, download or modify PLC runtime.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "apply", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE apply request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_get_bridge_result",
+        "Read a signed result of a queued IDE command, or show that it is pending.",
+        { requestId: z.string().regex(/^[a-f0-9]{32}$/) },
+        async ({ requestId }) => {
+            try {
+                const result = await getIdeResult(WORKSPACE_DIR, requestId);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+                    isError: result.state === "completed" && !result.ok
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE result could not be read: " + e.message }], isError: true };
+            }
+        }
+    );
+
     // --- End Tools ---
 
     console.error("SERVER.TS: Resources and Tools defined.");
@@ -1432,7 +2066,7 @@ except Exception as e:
         console.error("SERVER.TS: Connecting MCP server via stdio...");
         // No need to await connect here if startMcpServer is called by bin.ts which awaits it
         // await server.connect(transport);
-        server.connect(transport); // Connect but don't await here, let bin.ts handle waiting
+        await server.connect(transport); // Wait for MCP transport initialization
         console.error("SERVER.TS: MCP Server connection initiated via stdio.");
         // console.error("SERVER.TS: server.connect() promise resolved successfully."); // This log might be premature now
     } catch (error) {
