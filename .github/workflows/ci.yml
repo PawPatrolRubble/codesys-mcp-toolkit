@@ -4,8 +4,9 @@ on:
   push:
     branches:
       - 'fix/**'
+      - 'feat/**'
   pull_request:
-    branches: [main]
+    branches: [main, 'fix/**']
 
 jobs:
   node-tests:
