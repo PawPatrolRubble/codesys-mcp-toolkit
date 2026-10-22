@@ -22,9 +22,11 @@ console.error(`>>> Initial CWD: ${process.cwd()}`);
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { executeCodesysScript } from "./codesys_interop";
+import { executeCodesysScript as executeHeadlessCodesysScript } from "./codesys_interop";
 import { evaluateBuild, parseJsonRecord } from "./build_results";
-import { snapshotProject, previewCodeChange } from "./project_safety"; // Assumes this utility exists
+import { snapshotProject, previewCodeChange } from "./project_safety";
+import { executeBatchOperation, BatchChange } from "./batch_operations";
+import { setupIdeBridge, queueIdeRequest, getIdeResult } from "./ide_bridge"; // Assumes this utility exists
 import * as path from 'path';
 import { stat } from "fs/promises"; // For file existence check (async)
 import * as fsPromises from 'fs/promises'; // Use promises version of fs
@@ -35,6 +37,7 @@ interface ServerConfig {
     codesysPath: string;
     profileName: string;
     workspaceDir: string;
+    ideOnly?: boolean;
 }
 
 // --- Wrap server logic in an exported function ---
@@ -47,6 +50,13 @@ export async function startMcpServer(config: ServerConfig) {
     const WORKSPACE_DIR = config.workspaceDir;
     const codesysExePath = config.codesysPath;
     const codesysProfileName = config.profileName;
+    // IDE Attached mode never starts a second CODESYS instance. Headless
+    // operations fail explicitly while the live-IDE bridge remains available.
+    const executeCodesysScript = (script: string, exe: string, profile: string, timeoutMs?: number) => {
+        if (config.ideOnly)
+            throw new Error("Headless CODESYS operations are disabled with --ide-only; use ide_* tools");
+        return executeHeadlessCodesysScript(script, exe, profile, timeoutMs);
+    };
 
     console.error(`SERVER.TS: Using Workspace Directory: ${WORKSPACE_DIR}`);
     console.error(`SERVER.TS: Using CODESYS Path: ${codesysExePath}`);
@@ -58,7 +68,9 @@ export async function startMcpServer(config: ServerConfig) {
     try {
         // Using sync check here as it's part of initial setup before async operations start
         const fsChecker = require('fs');
-        if (!fsChecker.existsSync(codesysExePath)) {
+        if (config.ideOnly) {
+            console.error("SERVER.TS: IDE-only mode; skipping headless CODESYS executable validation.");
+        } else if (!fsChecker.existsSync(codesysExePath)) {
             console.error(`SERVER.TS ERROR: Determined CODESYS executable path does not exist: ${codesysExePath}`);
             // Consider throwing an error instead of exiting if bin.ts handles the catch
             throw new Error(`CODESYS executable not found at specified path: ${codesysExePath}`);
@@ -1875,6 +1887,171 @@ except Exception as e:
                 return { content: [{ type: "text" as const, text: "Explicit confirmRemoval=true is required." }], isError: true };
             return libraryOperation("remove", projectFilePath, libraryName, "", parentPath ?? "Application");
         });
+
+
+    // Bulk operations: plan first, then apply against the exact reviewed source hashes.
+    const batchChangeSchema = z.object({
+        action: z.literal("update").optional(),
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "preview_project_changes",
+        "Read multiple IEC objects and preview proposed source edits without saving. " +
+        "Returns project and original-section hashes required by apply_project_changes.",
+        {
+            projectFilePath: z.string().min(1),
+            changes: z.array(batchChangeSchema).min(1).max(20)
+        },
+        async ({ projectFilePath, changes }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                { mode: "preview", changes: changes as BatchChange[] },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+    server.tool(
+        "apply_project_changes",
+        "Apply 1-20 pre-reviewed IEC source edits in one CODESYS script with preflight, " +
+        "one SHA-256-verified project backup, one save, and optional fail-closed compilation. " +
+        "No automatic rollback or PLC download.",
+        {
+            projectFilePath: z.string().min(1),
+            expectedProjectSha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+            changes: z.array(batchChangeSchema).min(1).max(20),
+            compileAfterApply: z.boolean().optional()
+        },
+        async ({ projectFilePath, expectedProjectSha256, changes, compileAfterApply }) => {
+            const absPath = path.normalize(path.isAbsolute(projectFilePath) ?
+                projectFilePath : path.join(WORKSPACE_DIR, projectFilePath));
+            const outcome = await executeBatchOperation(
+                absPath,
+                {
+                    mode: "apply",
+                    expectedProjectSha256,
+                    changes: changes as BatchChange[],
+                    compileAfterApply: compileAfterApply ?? true
+                },
+                ENSURE_PROJECT_OPEN_PYTHON_SNIPPET,
+                (script, timeoutMs) => executeCodesysScript(script, codesysExePath, codesysProfileName, timeoutMs),
+                parseJsonRecord
+            );
+            return { content: [{ type: "text" as const, text: outcome.text }], isError: outcome.isError };
+        }
+    );
+
+
+    // CODESYS IDE Attached v1: user-triggered execution in the *existing* IDE session.
+    // Does not spawn a new CODESYS process or execute arbitrary Python from MCP.
+    server.tool(
+        "ide_bridge_setup",
+        "Install a signed local command queue and one-shot CODESYS Scripting bridge. " +
+        "In the already-open IDE run the returned .py file using Tools > Scripting > Execute Script File.",
+        {},
+        async () => {
+            try {
+                const location = await setupIdeBridge(WORKSPACE_DIR);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify({
+                        state: "configured",
+                        directory: location.directory,
+                        script: location.script,
+                        howToRun: "CODESYS IDE > Tools > Scripting > Execute Script File > select script",
+                        limitations: "Run the script again for each queued group. Changes are not auto-saved."
+                    }, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE bridge setup failed: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    const ideChangeSchema = z.object({
+        objectType: z.enum(["POU", "GVL", "DUT", "Method", "Property"]),
+        path: z.string().min(1),
+        declarationCode: z.string().max(200000).optional(),
+        implementationCode: z.string().max(200000).optional(),
+        expectedDeclarationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+        expectedImplementationSha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    }).strict();
+
+    server.tool(
+        "ide_probe_capabilities",
+        "Queue a read-only compatibility check of the already-open LeadSys Studio or CODESYS IDE. " +
+        "Run the generated execute_pending.py from Tools > Scripting, then call ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1) },
+        async ({ projectFilePath }) => {
+            try {
+                const queued = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "probe");
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(queued, null, 2) }],
+                    isError: false
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE compatibility probe could not be queued: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_preview_project_changes",
+        "Queue non-mutating ST code preview against the already-open IDE's in-memory project; " +
+        "requires manual execution of the IDE bridge script, then ide_get_bridge_result.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "preview", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE preview request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_apply_project_changes",
+        "Queue guarded IEC edits for the already-open IDE. Requires reviewed original section hashes. " +
+        "Does not save, compile, download or modify PLC runtime.",
+        { projectFilePath: z.string().min(1), changes: z.array(ideChangeSchema).min(1).max(20) },
+        async ({ projectFilePath, changes }) => {
+            try {
+                const result = await queueIdeRequest(WORKSPACE_DIR, projectFilePath, "apply", changes as BatchChange[]);
+                return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], isError: false };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE apply request rejected: " + e.message }], isError: true };
+            }
+        }
+    );
+
+    server.tool(
+        "ide_get_bridge_result",
+        "Read a signed result of a queued IDE command, or show that it is pending.",
+        { requestId: z.string().regex(/^[a-f0-9]{32}$/) },
+        async ({ requestId }) => {
+            try {
+                const result = await getIdeResult(WORKSPACE_DIR, requestId);
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+                    isError: result.state === "completed" && !result.ok
+                };
+            } catch (e: any) {
+                return { content: [{ type: "text" as const, text: "IDE result could not be read: " + e.message }], isError: true };
+            }
+        }
+    );
 
     // --- End Tools ---
 
